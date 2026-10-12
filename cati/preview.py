@@ -77,6 +77,32 @@ def pdf_pages(path):
     return int(match[1]) if match else 1
 
 
+def pdf_size(path):
+    """Proporción alto/ancho de la primera página, para reservar el hueco de cada página antes de dibujarla."""
+    info = run(['pdfinfo', str(path)]).stdout.decode(errors='replace')
+    match = re.search(r'^Page size:\s+([\d.]+) x ([\d.]+)', info, re.M)
+    return float(match[2]) / float(match[1]) if match and float(match[1]) else 1.414
+
+
+OFFICE = {'.docx', '.doc', '.odt', '.rtf', '.pptx', '.ppt', '.odp', '.xlsx', '.xls', '.ods', '.epub'}
+
+
+def office_pdf(path):
+    """Word, PowerPoint, Excel y OpenDocument con su maquetación real, convertidos a PDF con LibreOffice
+    (si está instalado). Perfil temporal propio: no toca la configuración de LibreOffice del usuario."""
+    office = shutil.which('soffice') or shutil.which('libreoffice')
+    if not office: return None
+    dest = cached(path, 'office', suffix='.pdf')
+    if dest.exists(): return dest
+    def write(target):
+        with tempfile.TemporaryDirectory(prefix='cati-office-') as work:
+            run([office, f'-env:UserInstallation=file://{work}/profile', '--headless', '--norestore', '--convert-to', 'pdf',
+                 '--outdir', work, str(path)], timeout=120)
+            made = Path(work) / (Path(path).stem + '.pdf')
+            if made.exists(): shutil.move(made, target)
+    return publish(dest, write)
+
+
 def pdf_page(path, page, width=1400):
     dest = cached(path, 'page', page, width)
     if dest.exists(): return dest
@@ -152,8 +178,9 @@ def read_text(path):
     from .readers import document
     path = Path(path)
     ext = path.suffix.lower()
-    if ext in {'.docx', '.odt'}:
-        return document(path)[:TEXT_LIMIT], False
+    if ext in OFFICE:
+        text = document(path)
+        return text[:TEXT_LIMIT], len(text) > TEXT_LIMIT
     with path.open('rb') as handle:
         raw = handle.read(TEXT_LIMIT + 1)
     if b'\x00' in raw[:4096]: raise ValueError('binario')

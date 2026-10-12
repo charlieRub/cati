@@ -11,7 +11,7 @@ from pathlib import Path
 
 from inotify_simple import INotify, flags
 
-from . import catalog
+from . import catalog, spelling
 from .config import DATA,load
 from .engine import Engine
 from .indexer import fingerprint,index,lock_path,reader_options,write_status
@@ -188,7 +188,10 @@ class Watcher:
         while not self.stop.is_set():
             if self.rescan.wait(timeout=max(10,self.config.get('scan_seconds',300))):self.rescan.clear()
             if self.stop.is_set():return
-            try:self.scan();self.backfill()
+            try:
+                self.scan();self.backfill()
+                # Vocabulary for typo correction: rebuilt here, the search window only loads it.
+                if not self.stop.is_set():spelling.save_if_stale(self.db_path)
             except Exception as exc:
                 self.error=f'Exploración: {exc}'
                 self.stop.wait(60);self.rescan.set()  # retry soon instead of waiting for the next periodic scan

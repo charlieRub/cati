@@ -61,6 +61,10 @@ def connect(path=None, threads=False):
         # Content fingerprint: an exact copy reuses the analysis of the original.
         add_column(db, 'files', 'fingerprint', 'TEXT')
         db.executescript('CREATE INDEX IF NOT EXISTS files_fingerprint ON files(fingerprint); PRAGMA user_version=4;')
+    if db.execute('PRAGMA user_version').fetchone()[0] < 5:
+        # Creation date (statx btime): «lo que creé en marzo». NULL until the next catalog pass fills it.
+        add_column(db, 'catalog', 'btime', 'INTEGER')
+        db.executescript('CREATE INDEX IF NOT EXISTS catalog_btime ON catalog(btime); PRAGMA user_version=5;')
     row = db.execute("SELECT value FROM meta WHERE key='fingerprint'").fetchone()
     if row and row[0] != FINGERPRINT:
         db.close()

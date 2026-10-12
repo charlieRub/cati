@@ -25,6 +25,10 @@ WHISPER_COMMIT = 'd2a764c648779feb36d44363f212a29b00aad1af'
 WHISPER_REPO = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main'
 WHISPER_MODELS = {'vulkan': ('ggml-large-v3-turbo-q5_0.bin', '394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2'),
                   'cpu': ('ggml-small-q5_1.bin', 'ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb')}
+# Word frequencies (MIT): which words exist in Spanish and English, so typo correction never «fixes» a real word.
+WORDS_REPO = 'https://raw.githubusercontent.com/hermitdave/FrequencyWords/525f9b560de45753a5ea01069454e72e9aa541c6/content/2018'
+WORD_LISTS = {'es': 'b4794c425f3500c21a0ff9367175e36795a978c928a36670e9ad6ae206fb7728',
+              'en': '7fea67ab954e2c01df6c608c9826e594cf36f8823b3243554f88245fb75dc506'}
 NERD_SYMBOLS = 'https://github.com/ryanoasis/nerd-fonts/releases/download/v3.4.0/NerdFontsSymbolsOnly.tar.xz'
 SYSTEMD = Path(os.getenv('XDG_CONFIG_HOME', Path.home() / '.config')) / 'systemd/user'
 
@@ -103,6 +107,19 @@ def models():
     step('Modelo local EmbeddingGemma 2 (≈865 MB, se descarga una vez)')
     for name, checksum in MODELS:
         download(f'{MODEL_REPO}/{MODEL_REVISION}/{name}', DATA / 'models' / name, checksum)
+
+
+def words():
+    """Listas de frecuencia de español e inglés (≈35 MB de descarga, ≈5 MB tras prepararlas)."""
+    from cati.config import DATA
+    from cati.spelling import DICTIONARIES, prepare_dictionary
+    step('Diccionario para corregir erratas')
+    folder = DATA / 'dict'
+    if all((folder / n).exists() for n in [*DICTIONARIES.values(), 'strong.npy', 'weak.npy']):
+        print('  ✓ ya preparado'); return
+    for language, checksum in WORD_LISTS.items():
+        download(f'{WORDS_REPO}/{language}/{language}_full.txt', folder / f'{language}_full.txt', checksum)
+    prepare_dictionary(folder)
 
 
 def voice(gpu):
@@ -253,6 +270,7 @@ def install(args):
     if not key.exists():
         key.write_text(secrets.token_urlsafe(32) + '\n'); key.chmod(0o600)
     models()
+    words()
     engine(args.gpu)
     if not args.no_voice: voice(args.gpu)
     fonts()

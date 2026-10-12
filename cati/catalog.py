@@ -1,4 +1,5 @@
 """Catálogo de nombres: cada archivo y carpeta, aunque su contenido no se analice."""
+import ctypes
 import os
 import time
 from pathlib import Path
@@ -19,15 +20,46 @@ def category(ext, is_dir=False):
     """Categoría visible de un elemento a partir de su extensión."""
     if is_dir: return "folder"
     if ext == ".pdf": return "pdf"
+    # Spreadsheets and slides are also read as text: their own category comes first.
+    if ext in SHEETS: return "sheet"
+    if ext in SLIDES: return "slides"
     if ext in TEXT or ext in OFFICE: return "document"
     if ext in IMAGES or ext in EXTRA_IMAGES: return "image"
     if ext in VIDEO: return "video"
     if ext in AUDIO: return "audio"
-    if ext in SHEETS: return "sheet"
-    if ext in SLIDES: return "slides"
     if ext in CODE or ext in EXTRA_CODE: return "code"
     if ext in ARCHIVES: return "archive"
     return "other"
+
+
+class _Time(ctypes.Structure):
+    _fields_ = [("sec", ctypes.c_int64), ("nsec", ctypes.c_uint32), ("_pad", ctypes.c_int32)]
+
+
+class _Statx(ctypes.Structure):
+    _fields_ = [("mask", ctypes.c_uint32), ("blksize", ctypes.c_uint32), ("attributes", ctypes.c_uint64),
+                ("nlink", ctypes.c_uint32), ("uid", ctypes.c_uint32), ("gid", ctypes.c_uint32), ("mode", ctypes.c_uint16),
+                ("_pad", ctypes.c_uint16), ("ino", ctypes.c_uint64), ("size", ctypes.c_uint64), ("blocks", ctypes.c_uint64),
+                ("attributes_mask", ctypes.c_uint64), ("atime", _Time), ("btime", _Time), ("ctime", _Time), ("mtime", _Time),
+                ("_rest", ctypes.c_uint8 * 144)]
+
+
+try:
+    _statx = ctypes.CDLL(None, use_errno=True).statx
+    _statx.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.POINTER(_Statx)]
+except (AttributeError, OSError):
+    _statx = None
+AT_FDCWD, AT_SYMLINK_NOFOLLOW, AT_STATX_DONT_SYNC, STATX_BTIME = -100, 0x100, 0x4000, 0x800
+
+
+def birth(path, fallback=0):
+    """Fecha de creación en ns (statx); `fallback` si el sistema de archivos no la guarda."""
+    if _statx is None: return fallback
+    buffer = _Statx()
+    if _statx(AT_FDCWD, os.fsencode(path), AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC, STATX_BTIME, ctypes.byref(buffer)) != 0:
+        return fallback
+    if not buffer.mask & STATX_BTIME or buffer.btime.sec <= 0: return fallback
+    return buffer.btime.sec * 1_000_000_000 + buffer.btime.nsec
 
 
 def describe(path, root, is_dir):
@@ -73,15 +105,17 @@ def walk_all(roots, excluded=(), stop=None, on_directory=None):
                 yield root, path, is_dir, 0 if is_dir else stat.st_size, stat.st_mtime_ns
 
 
-def row(root, path, is_dir, size, mtime):
+def row(root, path, is_dir, size, mtime, btime=None):
     name, folders, ext = describe(path, root, is_dir)
-    return str(path), name, folders, ext, int(is_dir), size, mtime
+    return str(path), name, folders, ext, int(is_dir), size, mtime, birth(path, mtime) if btime is None else btime
 
 
 def sync(db, roots, excluded=(), stop=None, on_directory=None, files=None):
     """Aplica solo las diferencias con el catálogo guardado; devuelve el número de elementos.
     Con `files`, acumula (ruta, tamaño, mtime) de cada archivo para no recorrer el disco dos veces."""
-    known = {path: (mtime, size) for path, mtime, size in db.execute("SELECT path,mtime,size FROM catalog")}
+    # Rows saved before creation dates existed (btime NULL) count as changed and get it filled in.
+    known = {path: (mtime, size) if btime is not None else None
+             for path, mtime, size, btime in db.execute("SELECT path,mtime,size,btime FROM catalog")}
     seen = set()
     changed = []
     for root, path, is_dir, size, mtime in walk_all(roots, excluded, stop, on_directory):
@@ -102,9 +136,9 @@ def sync(db, roots, excluded=(), stop=None, on_directory=None, files=None):
 def upsert(db, rows):
     if not rows: return
     with db:
-        db.executemany("""INSERT INTO catalog(path,name,folders,ext,is_dir,size,mtime) VALUES(?,?,?,?,?,?,?)
+        db.executemany("""INSERT INTO catalog(path,name,folders,ext,is_dir,size,mtime,btime) VALUES(?,?,?,?,?,?,?,?)
           ON CONFLICT(path) DO UPDATE SET name=excluded.name,folders=excluded.folders,ext=excluded.ext,
-          is_dir=excluded.is_dir,size=excluded.size,mtime=excluded.mtime""", rows)
+          is_dir=excluded.is_dir,size=excluded.size,mtime=excluded.mtime,btime=excluded.btime""", rows)
 
 
 def touch(db, roots, paths):

@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import tomllib
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -137,6 +138,8 @@ def css(c):
     .canvas {{ background: {c['background']}; margin: 0 22px; border: 1px solid {c['color8']}; }}
     .canvas textview, .canvas textview text {{ background: {c['background']}; }}
     .page {{ background: white; }}
+    listview.pages {{ background: transparent; padding: 12px 12px 0 12px; }}
+    listview.pages > row {{ padding: 0; background: transparent; }}
     .actions {{ padding: 12px 22px 16px 22px; }}
     button.action {{ padding: 5px 12px; margin-right: 8px; border: 1px solid {c['color8']}; color: {c['foreground']}; font-size: 12px; }}
     button.action:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
@@ -567,6 +570,7 @@ class Cati(Gtk.Application):
         mark_search()  # the indexer steps aside from the GPU while you type
         self.generation += 1
         self.user_moved = False
+        self.literal = False  # a new phrase gets its typos corrected again
         text = self.entry.get_text().strip()
         if not text and not self.query_image:
             for name in list(self.timers): GLib.source_remove(self.timers.pop(name))
@@ -591,7 +595,8 @@ class Cati(Gtk.Application):
 
         def work():
             if generation != self.generation: return None
-            return self.searcher.run(query, limit=150, lexical=exact, image_path=image_path, semantic=semantic)
+            return self.searcher.run(query, limit=150, lexical=exact, image_path=image_path, semantic=semantic,
+                                     exact=getattr(self, 'literal', False))
 
         def done(future):
             try: results = future.result()
@@ -600,6 +605,10 @@ class Cati(Gtk.Application):
                 return
             if results is not None: GLib.idle_add(self.render, results, generation, semantic)
         self.search_pool.submit(work).add_done_callback(done)
+
+    def search_literal(self):
+        self.literal = True
+        self.search_now()
 
     def busy(self, active):
         self.searching = active
@@ -662,6 +671,13 @@ class Cati(Gtk.Application):
             chip.connect('toggled', self.chip_toggled)
             self.chips.append(chip)
         self.clear(self.tags)
+        if results.intent.corrected:
+            # «factra del dentsta» → results for «factura del dentista», one click away from the literal phrase.
+            self.tags.append(label(f'\U000F04C6 Resultados de «{results.intent.corrected}»', 'tag'))
+            literal = button(f'Buscar «{results.intent.original}»', 'switch', lambda *_: self.search_literal(),
+                             'Buscar exactamente lo que escribiste, sin corregir')
+            literal.set_margin_end(8)
+            self.tags.append(literal)
         for tag in results.intent.labels:
             self.tags.append(label('\U000F04F9 ' + tag, 'tag'))
         if self.query_image:
@@ -1091,6 +1107,7 @@ class Cati(Gtk.Application):
             if kind == 'folder': self.preview_folder(body, hit)
             elif kind == 'image' and ext not in {'.psd', '.xcf', '.raw', '.cr2', '.nef', '.dng', '.kra'}: self.preview_image(body, hit)
             elif kind == 'pdf': self.preview_pdf(body, hit)
+            elif ext in preview.OFFICE: self.preview_office(body, hit)
             elif kind in {'video', 'audio'} or ext in MEDIA_EXTS: self.preview_media(body, hit)
             elif ext in {'.html', '.htm'}: self.preview_html(body, hit)
             elif kind in TEXT_PREVIEW or kind == 'sheet' and ext in {'.csv', '.tsv'}: self.preview_text(body, hit)
@@ -1127,39 +1144,89 @@ class Cati(Gtk.Application):
             body.append(picture)
         self.background_job(work, apply)
 
-    def preview_pdf(self, body, hit):
-        state = {'page': int(hit['loc'] or 1), 'pages': None}
+    def preview_pdf(self, body, hit, source=None, first=None):
+        """Todas las páginas seguidas: la rueda del ratón recorre el documento y cada página se dibuja
+        cuando aparece. Las flechas (y Alt ← →) saltan de página; se abre en la página que coincide."""
+        path = source or hit['path']
         counter = label('', 'pager')
         previous = button(LEFT, 'switch', lambda *_: turn(-1), 'Página anterior (Alt ←)')
         following = button(RIGHT, 'switch', lambda *_: turn(1), 'Página siguiente (Alt →)')
         for widget in (previous, counter, following): self.toolbar.append(widget)
         counter.set_margin_start(8); counter.set_margin_end(2)
-        holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
-        body.append(holder)
+        wait = self.placeholder(body, 'Abriendo el documento…')
+        state = {'pages': 0, 'page': int(first or hit.get('loc') or 1)}
+        textures, loading = OrderedDict(), set()
 
         def turn(step):
-            if state['pages'] is None: return
-            page = max(1, min(state['pages'], state['page'] + step))
-            if page != state['page']: state['page'] = page; load()
+            if state['pages']: show(max(1, min(state['pages'], state['page'] + step)))
         self.pager = turn
 
-        def load():
-            self.clear(holder)
-            wait = self.placeholder(holder, f"Renderizando página {state['page']}…")
-            page = state['page']
+        def request(page, widget):
+            if page in loading: return
+            loading.add(page)
 
             def work():
-                if state['pages'] is None: state['pages'] = preview.pdf_pages(hit['path'])
-                return preview.pdf_page(hit['path'], min(page, state['pages']))
+                if widget.page != page: return None  # scrolled past before its turn came
+                return Gdk.Texture.new_from_filename(str(preview.pdf_page(path, page)))
 
             def apply(value):
-                self.clear(holder)
-                if isinstance(value, Exception):
-                    holder.append(label(f'No se pudo renderizar: {value}', 'empty', xalign=.5, vexpand=True)); return
-                counter.set_text(f"{state['page']} / {state['pages']}")
-                self.scrolled_picture(holder, value)
+                loading.discard(page)
+                if value is None or isinstance(value, Exception): return
+                textures[page] = value
+                while len(textures) > 24: textures.popitem(last=False)
+                if widget.page == page: widget.set_texture(value)
             self.background_job(work, apply)
-        load()
+
+        def bind(_, item):
+            widget = item.get_child()
+            widget.page = int(item.get_item().get_string())
+            widget.set_texture(textures.get(widget.page))
+            if widget.page not in textures: request(widget.page, widget)
+
+        def apply(value):
+            body.remove(wait)
+            if isinstance(value, Exception):
+                body.append(label(f'No se pudo abrir: {value}', 'empty', xalign=.5, vexpand=True)); return
+            pages, ratio = value
+            state['pages'] = pages
+            state['page'] = max(1, min(pages, state['page']))
+            factory = Gtk.SignalListItemFactory()
+            factory.connect('setup', lambda _, item: item.set_child(SheetPage(ratio)))
+            factory.connect('bind', bind)
+            model = Gtk.NoSelection(model=Gtk.StringList.new([str(n) for n in range(1, pages + 1)]))
+            view = Gtk.ListView(model=model, factory=factory, css_classes=['pages'])
+            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER, child=view)
+            body.append(scroll)
+            adjustment = scroll.get_vadjustment()
+
+            def follow(*_):
+                # Page shown at the top third of the view, for the counter.
+                span = adjustment.get_upper() / max(1, pages)
+                state['page'] = max(1, min(pages, int((adjustment.get_value() + adjustment.get_page_size() / 3) / max(span, 1)) + 1))
+                counter.set_text(f"{state['page']} / {pages}")
+            adjustment.connect('value-changed', follow)
+            counter.set_text(f"{state['page']} / {pages}")
+            self.pdf_view = view
+            if state['page'] > 1: GLib.idle_add(lambda: (view.scroll_to(state['page'] - 1, Gtk.ListScrollFlags.NONE, None), False)[1])
+
+        def show(page):
+            state['page'] = page
+            view = getattr(self, 'pdf_view', None)
+            if view is not None: view.scroll_to(page - 1, Gtk.ListScrollFlags.NONE, None)
+        self.pdf_view = None
+        self.background_job(lambda: (preview.pdf_pages(path), preview.pdf_size(path)), apply)
+
+    def preview_office(self, body, hit):
+        """Con LibreOffice, el documento tal cual se imprimiría; sin él, su texto."""
+        if not (shutil_which('soffice') or shutil_which('libreoffice')):
+            self.preview_text(body, hit); return
+        wait = self.placeholder(body, 'Maquetando el documento…')
+
+        def apply(value):
+            body.remove(wait)
+            if isinstance(value, Exception) or value is None: self.preview_text(body, hit)
+            else: self.preview_pdf(body, hit, source=value, first=1)
+        self.background_job(lambda: preview.office_pdf(hit['path']), apply)
 
     def preview_html(self, body, hit):
         stack = Gtk.Stack(vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
@@ -1686,6 +1753,36 @@ class Cati(Gtk.Application):
     def toggle_index(self):
         from .service import start_watch, stop_watch
         stop_watch() if self.active_index() else start_watch()
+
+
+class SheetPage(Gtk.Widget):
+    """Una página del visor continuo: ocupa su hueco (con la proporción del documento) antes de dibujarse."""
+    def __init__(self, ratio):
+        super().__init__()
+        self.ratio = ratio
+        self.texture = None
+        self.page = 0
+        self.add_css_class('page')
+        self.set_margin_bottom(12)
+
+    def set_texture(self, texture):
+        self.texture = texture
+        if texture: self.ratio = texture.get_height() / texture.get_width()
+        self.queue_resize()
+
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, orientation, for_size):
+        if orientation == Gtk.Orientation.HORIZONTAL: return 0, 900, -1, -1
+        size = int((for_size if for_size > 0 else 900) * self.ratio)
+        return size, size, -1, -1
+
+    def do_snapshot(self, snapshot):
+        if self.texture is None: return  # the white page (CSS) stands in while it renders
+        width = self.get_width()
+        snapshot.append_scaled_texture(self.texture, Gsk.ScalingFilter.TRILINEAR,
+                                       Graphene.Rect().init(0, 0, width, width * self.ratio))
 
 
 class Page(Gtk.Widget):
