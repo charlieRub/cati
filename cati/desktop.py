@@ -113,9 +113,9 @@ def install_hyprland(binding='SUPER ALT, U'):
         pass
     pattern = APP_ID.replace('.', r'\.')
     if hyprland_version() >= (0, 53):
-        rules = '\n'.join(f'windowrule = {rule}, match:class ^{pattern}$' for rule in ('float on', 'center on', 'size 1240 780'))
+        rules = '\n'.join(f'windowrule = {rule}, match:class ^{pattern}$' for rule in ('float on', 'center on', 'size 1240 780', 'opacity 1.0 override'))
     else:
-        rules = '\n'.join(f'windowrulev2 = {rule}, class:^({pattern})$' for rule in ('float', 'center', 'size 1240 780'))
+        rules = '\n'.join(f'windowrulev2 = {rule}, class:^({pattern})$' for rule in ('float', 'center', 'size 1240 780', 'opacity 1.0 override 1.0 override'))
     previous = HYPR_FILE.read_text() if HYPR_FILE.exists() else None
     HYPR_FILE.write_text(f'''# Cati: ventana flotante centrada, atajo y arranque residente
 {rules}

@@ -26,6 +26,7 @@ from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gtk, GtkSource, Pango
 
 from . import preview, properties
 from .config import APP_ID, DATA, PROJECT, load, save
+from .engine import mark_search
 from .query import normalize, stem
 from .search import searcher
 from .store import opened
@@ -41,8 +42,6 @@ SINGULAR = {'folder': 'Carpeta', 'document': 'Documento', 'pdf': 'PDF', 'image':
             'audio': 'Audio', 'sheet': 'Hoja de cálculo', 'slides': 'Presentación', 'code': 'Código',
             'archive': 'Comprimido', 'other': 'Archivo'}
 ORDER = ['all', 'folder', 'document', 'pdf', 'image', 'video', 'audio', 'sheet', 'slides', 'code', 'archive', 'other']
-SUGGESTIONS = ['documento html de pirámides', 'fotos de esta semana', 'pdfs en descargas', 'carpeta de egipto',
-               'vídeos de más de 1 GB']
 SEARCH, COG, CAMERA, EXACT = '\U000F0349', '\U000F0493', '\U000F0100', '\U000F0B34'
 OPEN, FOLDER_OPEN, COPY, LEFT, RIGHT = '\U000F03CC', '\U000F0770', '\U000F018F', '\U000F0141', '\U000F0142'
 INFO = '\U000F02FD'
@@ -95,6 +94,7 @@ def css(c):
     button.tool:hover {{ color: {c['foreground']}; border-color: {c['color8']}; }}
     button.tool:checked {{ color: {c['background']}; background: {c['accent']}; border-color: {c['accent']}; }}
     .spinner {{ color: {c['accent']}; margin-right: 8px; }}
+    button.tool.warning {{ color: {c['red']}; border-color: {c['red']}; }}
     button.tool.listening {{ color: {c['background']}; background: {c['red']}; border-color: {c['red']}; }}
     .meter {{ color: {c['red']}; font-size: 16px; margin-right: 10px; }}
     menubutton.action > button {{ all: unset; padding: 5px 10px; border: 1px solid {c['color8']}; color: {c['foreground']}; margin-right: 8px; }}
@@ -110,30 +110,28 @@ def css(c):
     button.chip:checked {{ color: {c['accent']}; border-color: {c['accent']}; background: alpha({c['accent']}, .08); }}
     button.chip .count {{ margin-left: 7px; opacity: .65; }}
     .tag {{ color: {c['magenta']}; font-size: 12px; margin-left: 10px; }}
-    button.suggestion {{ padding: 3px 10px; margin-right: 6px; color: {c['foreground']}; border: 1px dashed {c['color8']}; font-size: 12px; }}
-    button.suggestion:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
     .hint {{ color: {c['muted']}; font-size: 12px; }}
 
     .results {{ background: transparent; }}
     .results > row {{ padding: 9px 16px 9px 14px; border-left: 3px solid transparent; outline: none; }}
     .results > row:hover {{ background: {c['lighter_background']}; }}
     .results > row:selected {{ background: {c['selection']}; border-left-color: {c['accent']}; }}
-    .section {{ color: {c['muted']}; font-size: 11px; letter-spacing: 1px; padding: 12px 18px 4px 18px; }}
+    .section {{ color: {c['muted']}; font-size: 12px; letter-spacing: 1px; padding: 12px 18px 4px 18px; }}
     .glyph {{ font-size: 24px; min-width: 52px; min-height: 52px; background: {c['lighter_background']}; }}
     .thumb {{ min-width: 52px; min-height: 52px; background: {c['darker_background']}; }}
     .name {{ font-weight: bold; font-size: 14px; }}
-    .meta {{ color: {c['muted']}; font-size: 11px; }}
+    .meta {{ color: {c['muted']}; font-size: 12px; }}
     .excerpt {{ color: alpha({c['foreground']}, .78); font-size: 12px; }}
-    .why {{ color: {c['muted']}; font-size: 10px; }}
-    .copies {{ color: {c['magenta']}; font-size: 10px; margin-left: 6px; }}
+    .why {{ color: {c['muted']}; font-size: 12px; }}
+    .copies {{ color: {c['magenta']}; font-size: 12px; margin-left: 6px; }}
 
     .preview {{ background: {c['darker_background']}; }}
     .preview-head {{ padding: 18px 22px 12px 22px; }}
     .preview-glyph {{ font-size: 30px; margin-right: 14px; }}
     .preview-title {{ font-size: 17px; font-weight: bold; }}
-    .preview-path {{ color: {c['muted']}; font-size: 11px; }}
+    .preview-path {{ color: {c['muted']}; font-size: 12px; }}
     .facts {{ padding: 0 22px 12px 22px; }}
-    .fact {{ color: {c['foreground']}; font-size: 11px; padding: 2px 8px; margin-right: 6px; background: {c['lighter_background']}; }}
+    .fact {{ color: {c['foreground']}; font-size: 12px; padding: 2px 8px; margin-right: 6px; background: {c['lighter_background']}; }}
     .quote {{ margin: 0 22px 12px 22px; padding: 8px 12px; border-left: 2px solid {c['magenta']};
               background: alpha({c['magenta']}, .06); font-size: 12px; }}
     .canvas {{ background: {c['background']}; margin: 0 22px; border: 1px solid {c['color8']}; }}
@@ -144,11 +142,11 @@ def css(c):
     button.action:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
     button.action:checked {{ border-color: {c['accent']}; color: {c['accent']}; background: alpha({c['accent']}, .10); }}
     button.action.primary {{ background: {c['accent']}; color: {c['background']}; border-color: {c['accent']}; }}
-    button.action .key {{ color: inherit; opacity: .6; margin-left: 8px; font-size: 10px; }}
+    button.action .key {{ color: inherit; opacity: .6; margin-left: 8px; font-size: 12px; }}
     .pager {{ color: {c['muted']}; font-size: 12px; }}
-    button.switch {{ padding: 2px 10px; color: {c['muted']}; border: 1px solid {c['color8']}; font-size: 11px; margin-left: 6px; }}
+    button.switch {{ padding: 2px 10px; color: {c['muted']}; border: 1px solid {c['color8']}; font-size: 12px; margin-left: 6px; }}
     button.switch:checked {{ color: {c['accent']}; border-color: {c['accent']}; }}
-    .prop-section {{ color: {c['accent']}; font-size: 11px; letter-spacing: 1px; margin: 16px 0 6px 2px; }}
+    .prop-section {{ color: {c['accent']}; font-size: 12px; letter-spacing: 1px; margin: 16px 0 6px 2px; }}
     .props {{ background: transparent; }}
     expander.prop-group {{ margin: 4px 0; }}
     expander.prop-group title {{ color: {c['foreground']}; font-size: 12px; padding: 6px 4px; }}
@@ -163,12 +161,12 @@ def css(c):
     .entry-row:hover {{ background: {c['lighter_background']}; }}
     .grid-thumb {{ background: {c['background']}; }}
 
-    .footer {{ padding: 7px 20px; border-top: 1px solid {c['color8']}; background: {c['darker_background']}; font-size: 11px; color: {c['muted']}; }}
+    .footer {{ padding: 7px 20px; border-top: 1px solid {c['color8']}; background: {c['darker_background']}; font-size: 12px; color: {c['muted']}; }}
     .brand {{ color: {c['accent']}; font-weight: bold; letter-spacing: 2px; margin-right: 14px; }}
     .dot {{ color: {c['green']}; margin-right: 8px; }}
     .dot.busy {{ color: {c['yellow']}; }}
     .dot.off {{ color: {c['muted']}; }}
-    .kbd {{ color: {c['foreground']}; padding: 0 5px; border: 1px solid {c['color8']}; margin: 0 4px 0 12px; font-size: 10px; }}
+    .kbd {{ color: {c['foreground']}; padding: 0 5px; border: 1px solid {c['color8']}; margin: 0 4px 0 12px; font-size: 12px; }}
 
     .cati-dialog .panel {{ padding: 26px; }}
     .cati-dialog .heading {{ font-size: 18px; font-weight: bold; color: {c['accent']}; }}
@@ -355,6 +353,10 @@ class Cati(Gtk.Application):
             self.show()
             return
         self.hold()  # stays resident after the window is hidden
+        # Crisp text at fractional scales (1,25…): GTK's automatic mode skips hinting there.
+        settings = Gtk.Settings.get_default()
+        if hasattr(Gtk, 'FontRendering'): settings.set_property('gtk-font-rendering', Gtk.FontRendering.MANUAL)
+        settings.set_property('gtk-hint-font-metrics', True)
         self.provider = Gtk.CssProvider()
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.apply_theme()
@@ -562,6 +564,7 @@ class Cati(Gtk.Application):
         self.timers[name] = GLib.timeout_add(delay, fire)
 
     def changed(self, *_):
+        mark_search()  # the indexer steps aside from the GPU while you type
         self.generation += 1
         self.user_moved = False
         text = self.entry.get_text().strip()
@@ -626,12 +629,11 @@ class Cati(Gtk.Application):
         self.results_intent = None
         self.hits = hits
         self.category = 'all'
-        self.clear(self.chips); self.clear(self.tags)
-        self.chips.append(label('Prueba:', 'hint'))
-        self.chips.get_last_child().set_margin_end(10)
-        for text in SUGGESTIONS:
-            self.chips.append(button(text, 'suggestion', lambda _, value=text: self.entry.set_text(value)))
-        self.timing.set_text('')
+        self.clear(self.chips)
+        if self.undo is None:
+            self.clear(self.tags)
+            self.timing.set_text('')
+        self.filters.set_visible(self.undo is not None)  # nothing to filter yet: only the recent files
         self.fill(hits, 'MODIFICADOS RECIENTEMENTE', [])
         return False
 
@@ -640,6 +642,7 @@ class Cati(Gtk.Application):
         if final: self.busy(False)
         self.results_intent = results.intent
         self.hits = results.hits
+        self.filters.set_visible(True)
         counts = {}
         for hit in self.hits: counts[hit['kind']] = counts.get(hit['kind'], 0) + 1
         if self.category != 'all' and self.category not in counts: self.category = 'all'
@@ -1449,7 +1452,7 @@ class Cati(Gtk.Application):
         self.show()
         self.listening = stop = threading.Event()
         self.mic.add_css_class('listening')
-        self.entry.set_text('')
+        if self.entry.get_text(): self.entry.set_text('')
         self.entry.set_placeholder_text('Te escucho… di lo que buscas o una orden como «abre el segundo»')
         levels = []
         # The model loads while you speak, so the first phrase is as quick as the rest.
@@ -1476,6 +1479,12 @@ class Cati(Gtk.Application):
             GLib.idle_add(self.voice_result, future.result())
         self.preview_pool.submit(work).add_done_callback(done)
 
+    def reset_voice_hint(self):
+        self.mic.remove_css_class('warning')
+        if self.listening is None:
+            self.entry.set_placeholder_text('Describe lo que buscas: «documento html de pirámides», «fotos de ayer»…')
+        return False
+
     @staticmethod
     def safe(callback):
         try: callback()
@@ -1489,7 +1498,13 @@ class Cati(Gtk.Application):
         if not result: return False
         action, *args = result
         if action == 'error':
-            self.empty_preview(*args); return False
+            # In the search bar: the results list cannot cover it.
+            title, detail = args
+            self.entry.set_placeholder_text(f'{title}. {detail}')
+            self.timing.set_text(title)
+            self.mic.add_css_class('warning')
+            GLib.timeout_add_seconds(8, self.reset_voice_hint)
+            return False
         if action == 'search':
             self.entry.set_text(args[0]); self.entry.set_position(-1)
         elif action == 'open':
@@ -1578,6 +1593,7 @@ class Cati(Gtk.Application):
     def after_change(self, message, undo):
         """Refresca los resultados y ofrece deshacer durante diez segundos."""
         self.undo = (message, undo)
+        self.filters.set_visible(True)
         self.timing.set_text(message)
         self.clear(self.tags)
         self.tags.append(button(f'{UNDO}  Deshacer (Ctrl+Z)', 'undo', lambda *_: self.undo_action()))
@@ -1589,6 +1605,7 @@ class Cati(Gtk.Application):
         if self.undo is token:
             self.undo = None
             self.clear(self.tags)
+            if not self.entry.get_text().strip(): self.filters.set_visible(False)
         return False
 
     def undo_action(self):

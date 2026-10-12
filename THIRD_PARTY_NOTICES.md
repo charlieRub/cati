@@ -39,6 +39,7 @@ No se incluyen en el repositorio; `install.sh` los descarga y verifica en tu equ
 | --- | --- | --- |
 | [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (tag `b11461`) | Motor local de embeddings; se compila con el parche de `patches/` | MIT, Copyright (c) 2023-2026 The ggml authors |
 | [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2), GGUF Q8 de `ggml-org` | Modelo de texto, imagen y audio | Según su ficha de modelo |
+| [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`v1.9.5`) y modelos [Whisper](https://huggingface.co/ggerganov/whisper.cpp) | Búsqueda por voz | MIT |
 | [RapidOCR](https://github.com/RapidAI/RapidOCR) y modelos [PP-OCRv6](https://github.com/PaddlePaddle/PaddleOCR) | Texto en imágenes, capturas y escaneos | Apache 2.0 |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | Ejecución de los modelos de OCR | MIT |
 | [Tesseract](https://github.com/tesseract-ocr/tesseract) (del sistema) | OCR de respaldo | Apache 2.0 |

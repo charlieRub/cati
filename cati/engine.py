@@ -2,6 +2,7 @@
 import base64
 import json
 import http.client
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,8 +17,32 @@ class EngineError(RuntimeError):
     pass
 
 
+ACTIVE = DATA / 'search.active'
+
+
+def mark_search():
+    """La búsqueda interactiva avisa de que está usando el motor."""
+    try: ACTIVE.touch()
+    except OSError: pass
+
+
+def yield_to_search(quiet=3.0, longest=60.0):
+    """El análisis de fondo espera a que pasen unos segundos sin búsquedas antes de usar la GPU."""
+    waited = 0.0
+    while waited < longest:
+        try: age = time.time() - ACTIVE.stat().st_mtime
+        except OSError: return
+        if age >= quiet: return
+        time.sleep(quiet - age)
+        waited += quiet - age
+
+
 class Engine:
-    def __init__(self, start=True):
+    # Background indexing uses one of the server's two slots; the other is always free for a search.
+    background_slot = threading.BoundedSemaphore(1)
+
+    def __init__(self, start=True, background=False):
+        self.background = background
         self.config = load()
         self.start = start
         self.key = (DATA / "engine.key").read_text().strip()
@@ -26,6 +51,13 @@ class Engine:
         self.ready = False
 
     def encode(self, inputs):
+        if self.background:
+            yield_to_search()
+            with Engine.background_slot: return self._encode(inputs)
+        mark_search()
+        return self._encode(inputs)
+
+    def _encode(self, inputs):
         if self.start and not self.ready:
             from .service import start
             start("engine")

@@ -34,7 +34,7 @@ class Watcher:
     def __init__(self, config=None, db_path=None, engine=None, status=True):
         self.config=config or load()
         self.db_path=db_path
-        self.engine=engine or Engine()
+        self.engine=engine or Engine(background=True)
         self.status_enabled=status
         self.stop=threading.Event()
         self.rescan=threading.Event()
