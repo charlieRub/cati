@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import queue
@@ -16,7 +17,11 @@ from xml.etree import ElementTree
 
 from PIL import Image, ImageOps
 
-TEXT = {".txt", ".text", ".md", ".markdown", ".rst", ".org", ".html", ".htm", ".docx", ".odt"}
+TEXT = {".txt", ".text", ".md", ".markdown", ".rst", ".org", ".html", ".htm", ".docx", ".odt",
+        ".rtf", ".epub", ".xlsx", ".pptx", ".ods", ".odp"}
+LEGACY_DOC = {".doc"}  # only with antiword or catdoc installed
+ARCHIVE_MEDIA = {".docx": "word/media/", ".pptx": "ppt/media/", ".xlsx": "xl/media/", ".odt": "Pictures/",
+                 ".odp": "Pictures/", ".ods": "Pictures/", ".epub": ""}
 IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 AUDIO = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
 VIDEO = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
@@ -49,6 +54,7 @@ def file_kind(path, code=False):
         return None
     if ext == ".pdf": return "pdf"
     if ext in TEXT: return "document"
+    if ext in LEGACY_DOC and (shutil.which("antiword") or shutil.which("catdoc")): return "document"
     if ext in IMAGES: return "image"
     if ext in AUDIO: return "audio"
     if ext in VIDEO: return "video"
@@ -135,20 +141,124 @@ def chunks(text, kind, loc=None, max_chars=1800):
         start = max(start + 1, end - 180)
 
 
+def xml_text(data, paragraph="p"):
+    tree = ElementTree.fromstring(data)
+    return "\n".join(" ".join(t.strip() for t in x.itertext() if t.strip()) for x in tree.iter() if x.tag.endswith("}" + paragraph))
+
+
+def numbered(names, prefix):
+    """slide10.xml after slide9.xml."""
+    return sorted((n for n in names if n.startswith(prefix) and n.endswith(".xml")),
+                  key=lambda n: int(re.search(r"(\d+)\.xml$", n)[1]) if re.search(r"(\d+)\.xml$", n) else 0)
+
+
+def spreadsheet(archive):
+    """Celdas de XLSX por filas: «Hoja 1: concepto | importe».""" 
+    shared = []
+    if "xl/sharedStrings.xml" in archive.namelist():
+        tree = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+        shared = ["".join(t.text or "" for t in si.iter() if t.tag.endswith("}t")) for si in tree if si.tag.endswith("}si")]
+    lines = []
+    for number, name in enumerate(numbered(archive.namelist(), "xl/worksheets/sheet"), 1):
+        lines.append(f"Hoja {number}:")
+        for row in ElementTree.fromstring(archive.read(name)).iter():
+            if not row.tag.endswith("}row"): continue
+            cells = []
+            for cell in row:
+                value = next((v.text for v in cell.iter() if v.tag.endswith("}v") or v.tag.endswith("}t")), None)
+                if value is None: continue
+                cells.append(shared[int(value)] if cell.get("t") == "s" and value.isdigit() and int(value) < len(shared) else value)
+            if cells: lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
+def rtf(raw):
+    """Texto plano de RTF: quita grupos de control y decodifica \\'xx y \\uN."""
+    raw = re.sub(r"\{\\\*[^{}]*\}|\{\\(?:fonttbl|colortbl|stylesheet|info|pict)[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "", raw)
+    raw = re.sub(r"\\'([0-9a-fA-F]{2})", lambda m: bytes([int(m[1], 16)]).decode("cp1252", "replace"), raw)
+    raw = re.sub(r"\\u(-?\d+)\??", lambda m: chr(int(m[1]) % 65536), raw)
+    raw = re.sub(r"\\(?:par|line)\b ?", "\n", raw)
+    raw = re.sub(r"\\[a-zA-Z]+-?\d* ?|[{}]", "", raw)
+    return raw.replace("\\\\", "\\")
+
+
 def document(path):
-    if path.suffix.lower() in {".docx", ".odt"}:
+    ext = path.suffix.lower()
+    if ext in {".docx", ".odt", ".ods", ".odp", ".pptx", ".xlsx", ".epub"}:
         with zipfile.ZipFile(path) as archive:
-            name = "word/document.xml" if path.suffix.lower() == ".docx" else "content.xml"
-            if archive.getinfo(name).file_size > 32 * 1024 * 1024:
+            if sum(i.file_size for i in archive.infolist() if i.filename.endswith((".xml", ".xhtml", ".html", ".htm"))) > 64 * 1024 * 1024:
                 raise ValueError("Documento expandido demasiado grande")
-            tree = ElementTree.fromstring(archive.read(name))
-            paragraphs = [" ".join(x.itertext()) for x in tree.iter() if x.tag.endswith("}p")]
-            return "\n".join(paragraphs)
+            names = archive.namelist()
+            if ext == ".docx": return xml_text(archive.read("word/document.xml"))
+            if ext in {".odt", ".ods", ".odp"}: return xml_text(archive.read("content.xml"))
+            if ext == ".xlsx": return spreadsheet(archive)
+            if ext == ".pptx":
+                return "\n\n".join(f"Diapositiva {n}:\n" + xml_text(archive.read(name)) for n, name in enumerate(numbered(names, "ppt/slides/slide"), 1))
+            # EPUB: chapters in reading order when the OPF spine is readable, else by name.
+            pages = sorted(n for n in names if n.lower().endswith((".xhtml", ".html", ".htm")))
+            try:
+                opf = next(n for n in names if n.endswith(".opf"))
+                tree = ElementTree.fromstring(archive.read(opf))
+                items = {i.get("id"): i.get("href") for i in tree.iter() if i.tag.endswith("}item")}
+                base = opf.rsplit("/", 1)[0] + "/" if "/" in opf else ""
+                ordered = [base + items[r.get("idref")] for r in tree.iter() if r.tag.endswith("}itemref") and r.get("idref") in items]
+                pages = [p for p in ordered if p in names] or pages
+            except (StopIteration, ElementTree.ParseError):
+                pass
+            return "\n\n".join(html_text(archive.read(name).decode("utf-8", "replace")) for name in pages)
+    if ext == ".doc":
+        tool = ["antiword", "-w", "0"] if shutil.which("antiword") else ["catdoc", "-w"]
+        return command([*tool, str(path)], timeout=60)
+    if ext == ".rtf":
+        return rtf(path.read_bytes().decode("latin-1"))
     text = path.read_text(encoding="utf-8", errors="replace")
-    if path.suffix.lower() in {".html", ".htm"}:
-        text = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", "", text, flags=re.S | re.I)
-        text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    if ext in {".html", ".htm"}: text = html_text(text)
     return text
+
+
+def html_text(text):
+    text = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", "", text, flags=re.S | re.I)
+    text = re.sub(r"<(?:br|/p|/div|/h\d|/li|/tr)\b[^>]*>", "\n", text, flags=re.I)
+    return html.unescape(re.sub(r"<[^>]+>", " ", text))
+
+
+def embedded_images(path, work, limit=24, minimum=256):
+    """Imágenes guardadas dentro de un DOCX/PPTX/XLSX/ODF/EPUB (sin iconos pequeños)."""
+    prefix = ARCHIVE_MEDIA.get(path.suffix.lower())
+    if prefix is None: return []
+    found = []
+    with zipfile.ZipFile(path) as archive:
+        for info in sorted(archive.infolist(), key=lambda i: -i.file_size):
+            name = info.filename
+            if not name.startswith(prefix) or Path(name).suffix.lower() not in IMAGES or info.file_size < 12 * 1024: continue
+            target = work / f"embedded-{len(found)}{Path(name).suffix.lower()}"
+            target.write_bytes(archive.read(name))
+            try:
+                with Image.open(target) as im:
+                    if min(im.size) < minimum: continue
+            except Exception:
+                continue
+            found.append(target)
+            if len(found) >= limit: break
+    return found
+
+
+def pdf_images(path, minimum=256, limit=40):
+    """Fotos de un PDF por página según «pdfimages -list»: sin máscaras, iconos ni logotipos repetidos."""
+    listing = command(["pdfimages", "-list", str(path)], timeout=60).splitlines()[2:]
+    seen, pages, position = set(), {}, {}
+    for line in listing:
+        parts = line.split()
+        if len(parts) < 12 or not parts[0].isdigit(): continue
+        page = int(parts[0])
+        # A one-page extraction numbers every image of that page (masks included) from 0.
+        local = position.get(page, 0)
+        position[page] = local + 1
+        width, height, obj = int(parts[3]), int(parts[4]), parts[10] + parts[11]
+        if parts[2] != "image" or min(width, height) < minimum or obj in seen or len(seen) >= limit: continue
+        seen.add(obj)  # a logo repeated on every page is the same object: only its first use counts
+        pages.setdefault(page, []).append(local)
+    return pages
 
 
 def image(path, dest, budget=140):
@@ -289,6 +399,13 @@ def extract(path, kind, config, stop=None, cursor=None):
         if "-----BEGIN " in text and "PRIVATE KEY-----" in text:
             raise ValueError("Archivo con clave privada excluido")
         yield from section(chunks(text, kind),0)
+        if kind == "document" and config["media"] and path.suffix.lower() in ARCHIVE_MEDIA:
+            with tempfile.TemporaryDirectory(prefix="cati-") as work:
+                pictures = []
+                for index, picture in enumerate(embedded_images(path, Path(work))):
+                    dest = image(picture, Path(work) / f"model-{index}.png", 140)
+                    pictures.append(Segment("Imagen dentro del documento", "doc-image", media=str(dest)))
+                yield from section(pictures, 1)
         return
     with tempfile.TemporaryDirectory(prefix="cati-") as work:
         work = Path(work)
@@ -306,9 +423,19 @@ def extract(path, kind, config, stop=None, cursor=None):
             count = int(re.search(r"^Pages:\s+(\d+)", info, flags=re.M)[1])
             if count > config["max_pdf_pages"]:
                 raise ValueError(f"PDF supera el límite de {config['max_pdf_pages']} páginas")
+            photos = {}
+            if config["media"]:
+                try: photos = pdf_images(path)
+                except (subprocess.SubprocessError, OSError, ValueError): photos = {}
+            texts = {}
             for page in range(max(1,position[0]), count + 1):
                 cancelled()
-                text = command(["pdftotext", "-f", str(page), "-l", str(page), "-layout", str(path), "-"])
+                if page not in texts:
+                    # One pdftotext call per 40 pages instead of one process per page.
+                    last = min(count, page + 39)
+                    block = command(["pdftotext", "-f", str(page), "-l", str(last), "-layout", str(path), "-"], timeout=120).split("\f")
+                    texts = {page + i: t for i, t in enumerate(block[:last - page + 1])}
+                text = texts.get(page, "")
                 pieces = []
                 if len(text.strip()) < 30:
                     prefix = work / "page"
@@ -317,6 +444,14 @@ def extract(path, kind, config, stop=None, cursor=None):
                     if config["media"]:
                         dest = image(prefix.with_suffix(".png"), work / "resized.png",280)
                         pieces.append(Segment(f"Página {page}", "pdf-image", page, media=str(dest)))
+                elif page in photos:
+                    for old in work.glob("photo-*"): old.unlink()
+                    command(["pdfimages", "-f", str(page), "-l", str(page), "-j", "-png", str(path), str(work / "photo")], timeout=60)
+                    extracted = sorted(work.glob("photo-*"))
+                    for index, local in enumerate(photos[page]):
+                        if local < len(extracted):
+                            dest = image(extracted[local], work / f"photo-model-{index}.png", 140)
+                            pieces.append(Segment(f"Imagen en la página {page}", "doc-image", page, media=str(dest)))
                 pieces.extend(chunks(text,"pdf",page))
                 yield from section(pieces,page)
         elif kind in {"audio", "video"}:

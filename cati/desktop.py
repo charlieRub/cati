@@ -24,6 +24,7 @@ HYPR = CONFIG_HOME / 'hypr'
 HYPR_FILE = HYPR / 'cati.conf'
 SOURCE_LINE = 'source = ~/.config/hypr/cati.conf'
 GNOME_PATH = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/cati/'
+GNOME_VOICE = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/cati-voice/'
 
 
 def environment():
@@ -63,6 +64,11 @@ Keywords=search;find;files;buscar;archivos;documentos;fotos;
 StartupNotify=false
 StartupWMClass={APP_ID}
 X-KDE-Shortcuts=Meta+Alt+U
+Actions=voice;
+
+[Desktop Action voice]
+Name=Buscar por voz
+Exec={LAUNCHER} voice
 ''')
     for tool in (['update-desktop-database', str(DESKTOP.parent)], ['gtk-update-icon-cache', '-q', '-t', str(DATA_HOME / 'icons/hicolor')]):
         if shutil.which(tool[0]): subprocess.run(tool, capture_output=True)
@@ -101,7 +107,7 @@ def install_hyprland(binding='SUPER ALT, U'):
         wanted = set(mods.upper().split())
         names = {'SUPER': 64, 'ALT': 8, 'CTRL': 4, 'CONTROL': 4, 'SHIFT': 1}
         mask = sum(names.get(m, 0) for m in wanted)
-        taken = [b for b in binds if b.get('modmask') == mask and b.get('key', '').lower() == key.lower() and 'cati' not in b.get('arg', '')]
+        taken = [b for b in binds if b.get('modmask') == mask and b.get('key', '').lower() in {key.lower(), 'v'} and 'cati' not in b.get('arg', '')]
         if taken: return f'{binding} ya está ocupado por «{taken[0].get("description") or taken[0].get("arg")}»; elige otro con --shortcut'
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
@@ -114,6 +120,7 @@ def install_hyprland(binding='SUPER ALT, U'):
     HYPR_FILE.write_text(f'''# Cati: ventana flotante centrada, atajo y arranque residente
 {rules}
 bindd = {mods}, {key}, Cati: buscar archivos, exec, {LAUNCHER} gui
+bindd = {mods}, V, Cati: buscar por voz, exec, {LAUNCHER} voice
 exec-once = {LAUNCHER} gui --background
 ''')
     main = HYPR / 'hyprland.conf'
@@ -137,11 +144,14 @@ def install_gnome(binding='<Super><Alt>u'):
     schema = 'org.gnome.settings-daemon.plugins.media-keys'
     current = subprocess.run(['gsettings', 'get', schema, 'custom-keybindings'], capture_output=True, text=True).stdout.strip()
     paths = re.findall(r"'([^']+)'", current)
-    if GNOME_PATH not in paths: paths.append(GNOME_PATH)
+    entries = ((GNOME_PATH, 'Cati', 'gui', binding), (GNOME_VOICE, 'Cati: buscar por voz', 'voice', '<Super><Alt>v'))
+    for path, *_ in entries:
+        if path not in paths: paths.append(path)
     subprocess.run(['gsettings', 'set', schema, 'custom-keybindings', str(paths)], check=True)
-    item = f'{schema}.custom-keybinding:{GNOME_PATH}'
-    for field, value in (('name', 'Cati'), ('command', f'{LAUNCHER} gui'), ('binding', binding)):
-        subprocess.run(['gsettings', 'set', item, field, value], check=True)
+    for path, name, verb, keys in entries:
+        item = f'{schema}.custom-keybinding:{path}'
+        for field, value in (('name', name), ('command', f'{LAUNCHER} {verb}'), ('binding', keys)):
+            subprocess.run(['gsettings', 'set', item, field, value], check=True)
     return None
 
 
@@ -153,13 +163,13 @@ def integrate(shortcut=True, binding=None):
     if session == 'hyprland':
         if shortcut:
             problem = install_hyprland(binding or 'SUPER ALT, U')
-            notes.append(problem or 'Hyprland: Super+Alt+U abre Cati; se queda residente al iniciar sesión.')
+            notes.append(problem or 'Hyprland: Super+Alt+U abre Cati y Super+Alt+V busca por voz; se queda residente al iniciar sesión.')
             if omarchy(): notes.append('Omarchy: Cati usa los colores de tu tema y aparece en Walker.')
     else:
         install_autostart()
         if shortcut and session == 'gnome':
             problem = install_gnome(binding or '<Super><Alt>u')
-            notes.append(problem or 'GNOME: Super+Alt+U abre Cati.')
+            notes.append(problem or 'GNOME: Super+Alt+U abre Cati y Super+Alt+V busca por voz.')
         elif shortcut and session == 'kde':
             notes.append('KDE: Meta+Alt+U queda propuesto en la entrada de Cati; confírmalo en Preferencias › Atajos si no se activa.')
         elif shortcut:
@@ -179,5 +189,5 @@ def remove():
     if environment() == 'gnome' and shutil.which('gsettings'):
         schema = 'org.gnome.settings-daemon.plugins.media-keys'
         current = subprocess.run(['gsettings', 'get', schema, 'custom-keybindings'], capture_output=True, text=True).stdout
-        paths = [p for p in re.findall(r"'([^']+)'", current) if p != GNOME_PATH]
+        paths = [p for p in re.findall(r"'([^']+)'", current) if p not in {GNOME_PATH, GNOME_VOICE}]
         subprocess.run(['gsettings', 'set', schema, 'custom-keybindings', str(paths)], capture_output=True)

@@ -4,6 +4,7 @@ Los vectores viven en memoria (float16) y se actualizan por incrementos cuando e
 indexador publica cambios, así que una consulta solo cuesta un producto matricial.
 """
 import math
+from difflib import SequenceMatcher
 import re
 import tempfile
 import threading
@@ -20,7 +21,7 @@ from .query import Intent, normalize, parse, stem
 from .readers import AUDIO, CODE, IMAGES, TEXT, VIDEO, image
 from .store import connect
 
-MODALITY = {'audio': 2, 'image': 1, 'pdf-image': 1, 'video-frame': 1}
+MODALITY = {'audio': 2, 'image': 1, 'pdf-image': 1, 'video-frame': 1, 'doc-image': 1}
 CATEGORY_EXTS = {'document': TEXT | OFFICE, 'pdf': {'.pdf'}, 'image': IMAGES | EXTRA_IMAGES, 'video': VIDEO,
                  'audio': AUDIO, 'sheet': SHEETS, 'slides': SLIDES, 'code': CODE | EXTRA_CODE, 'archive': ARCHIVES}
 LEGACY_KINDS = {'documents': {'document', 'pdf'}}
@@ -168,11 +169,34 @@ class Searcher:
             share, exact = self.name_share(terms, stems, row['name'], row['folders'])
             if terms and share <= 0: continue
             found[row['path']] = {'share': share, 'exact': exact, 'is_dir': bool(row['is_dir']),
-                                  'mtime': row['mtime'], 'size': row['size']}
+                                  'mtime': row['mtime'], 'size': row['size'], 'fuzzy': False}
+        # Typos: a long word with no exact hit looks for names sharing one of its 4-letter pieces
+        # (selective in the trigram index, so it stays fast), then keeps only close spellings.
+        missing = [s for s in stems if len(s) >= 5 and not any(s in normalize(r['name']) for r in rows[:300])]
+        if missing:
+            for path, entry in found.items():
+                row_name = next((r['name'] for r in rows if r['path'] == path), None)
+                if row_name is None: continue
+                share, _ = self.name_share(terms, stems, row_name, '', fuzzy=True)
+                if share > entry['share']: entry.update(share=share, fuzzy=True)
+            size = lambda w: 3 if len(w) <= 6 else 4  # one typo still leaves short words a 3-letter piece intact
+            per_word = {w: {w[i:i + size(w)] for i in range(len(w) - size(w) + 1)} for w in missing}
+            pieces = sorted(set().union(*per_word.values()))
+            sql = ('SELECT c.* FROM catalog_names JOIN catalog c ON c.id=catalog_names.rowid WHERE catalog_names MATCH ?'
+                   + (' AND ' + where if where else '') + ' LIMIT 3000')
+            for row in self.db.execute(sql, [' OR '.join(f'name:"{g}"' for g in pieces), *values]).fetchall():
+                if row['path'] in found: continue
+                name_n = normalize(row['name'])
+                # Cheap filter before the similarity check: share a third of the word's pieces.
+                if not any(sum(g in name_n for g in grams) >= max(1, len(grams) // 3) for grams in per_word.values()): continue
+                share, exact = self.name_share(terms, stems, row['name'], row['folders'], fuzzy=True)
+                if share >= .5:
+                    found[row['path']] = {'share': share * .85, 'exact': False, 'is_dir': bool(row['is_dir']),
+                                          'mtime': row['mtime'], 'size': row['size'], 'fuzzy': True}
         return found
 
     @staticmethod
-    def name_share(terms, stems, name, folders):
+    def name_share(terms, stems, name, folders, fuzzy=False):
         if not terms: return 0.0, False
         name_n = normalize(name)
         tokens = re.findall(r'\w+', name_n)
@@ -183,6 +207,11 @@ class Searcher:
             elif any(t.startswith(root) for t in tokens): total += .9
             elif len(root) >= 3 and root in name_n: total += .7
             elif any(t.startswith(root) for t in folder_tokens): total += .45
+            elif fuzzy and len(root) >= 5:
+                # «piramdes» ≈ «piramides»: similarity of the closest word, prefixes included.
+                best = max((SequenceMatcher(None, root, t[:len(root) + 2]).ratio() for t in tokens
+                            if len(t) >= 4 and t[0] == root[0] and abs(len(t) - len(root)) <= 4), default=0)
+                if best >= .8: total += .7 * best
         joined = ' '.join(terms)
         stem_part = name_n.rsplit(' ', 1)[0] if ' ' in name_n else name_n
         exact = joined == stem_part or joined == name_n
@@ -354,6 +383,7 @@ class Searcher:
                 previous = scored.get(path)
                 if previous and previous['score'] >= score: return
                 scored[path] = {'score': score, 'fid': fid, 'is_dir': is_dir, 'mtime': mtime, 'size': size,
+                                'fuzzy': bool(catalog and catalog.get('fuzzy')),
                                 'found': found, 'keyword': keyword, 'share': share, 'name': name,
                                 'use_meaning': use_meaning, 'folder': folder, 'indexed': info[1] if info else None}
 
@@ -406,13 +436,13 @@ class Searcher:
                 if keyword and keyword[0] == sid: excerpt = keyword[1]
                 loc, end, segment_kind = segment['loc'], segment['end'], segment['kind']
                 # Media segments carry internal labels («Fotograma en 32 s»), not readable text.
-                if segment_kind in {'image', 'name', 'video-frame', 'audio', 'pdf-image'}: excerpt = ''
+                if segment_kind in {'image', 'name', 'video-frame', 'audio', 'pdf-image', 'doc-image'}: excerpt = ''
                 if code and loc is not None and terms:
                     declaration = re.compile(r'(?:def|class|function|func|fn)\s+(?:' + '|'.join(re.escape(w) for w in terms) + r')\b')
                     for offset, line in enumerate(segment['text'].splitlines()):
                         if declaration.search(line): loc += offset; break
         reasons = []
-        if entry['name'] >= .5: reasons.append('nombre')
+        if entry['name'] >= .5: reasons.append('nombre aproximado' if entry.get('fuzzy') else 'nombre')
         if keyword: reasons.append('palabras')
         if entry['use_meaning'] and found and found['qualifies']: reasons.append('significado')
         if entry['folder'] is not None: reasons.append(f"{entry['folder']['count']} archivos relacionados")

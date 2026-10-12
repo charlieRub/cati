@@ -17,6 +17,8 @@ def main():
     sub.add_parser("all")
     sub.add_parser("status")
     sub.add_parser("doctor", help="comprueba las dependencias del sistema")
+    speak = sub.add_parser("voice", help="abre Cati escuchando (o transcribe --file)")
+    speak.add_argument("--file", type=Path, help="transcribe e interpreta un audio en vez de grabar")
     scan = sub.add_parser("scan")
     scan.add_argument("--code", action="store_true")
     query = sub.add_parser("search")
@@ -28,6 +30,15 @@ def main():
     folders.add_argument("paths", nargs="*")
     args = parser.parse_args()
     prepare()
+    if args.command == "voice":
+        if args.file:
+            from .voice import command, transcribe
+            text = transcribe(args.file, persistent=False)
+            print(json.dumps({"texto": text, "accion": command(text)}, ensure_ascii=False))
+            return
+        from .gui import run
+        run(voice=True)
+        return
     if args.command == "doctor":
         from .doctor import report
         raise SystemExit(1 if report() else 0)

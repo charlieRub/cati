@@ -20,6 +20,11 @@ LLAMA_COMMIT = '4d756bc72bf00a4aacf410ae15a2d315f3db400d'
 MODEL_REPO = 'https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve'
 MODELS = [('embeddinggemma-2-Q8_0.gguf', '2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135'),
           ('mmproj-embeddinggemma-2-Q8_0.gguf', 'c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f')]
+WHISPER_TAG = 'v1.9.5'
+WHISPER_COMMIT = 'd2a764c648779feb36d44363f212a29b00aad1af'
+WHISPER_REPO = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main'
+WHISPER_MODELS = {'vulkan': ('ggml-large-v3-turbo-q5_0.bin', '394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2'),
+                  'cpu': ('ggml-small-q5_1.bin', 'ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb')}
 NERD_SYMBOLS = 'https://github.com/ryanoasis/nerd-fonts/releases/download/v3.4.0/NerdFontsSymbolsOnly.tar.xz'
 SYSTEMD = Path(os.getenv('XDG_CONFIG_HOME', Path.home() / '.config')) / 'systemd/user'
 
@@ -37,7 +42,7 @@ def dependencies(install):
     step('Comprobando dependencias del sistema')
     missing = doctor.report()
     if missing and install:
-        command = doctor.install_command(missing + [n for n, ok in doctor.check().items() if not ok and n in {'gstreamer', 'browser', 'metadata'}])
+        command = doctor.install_command(missing + [n for n, ok in doctor.check().items() if not ok and n in {'gstreamer', 'browser', 'metadata', 'microphone'}])
         if not command: raise SystemExit('No reconozco tu distribución; instala los paquetes indicados arriba.')
         print(f'\nEjecutando: {command}')
         run(command.split())
@@ -72,28 +77,57 @@ def digest(path):
         return hashlib.file_digest(handle, 'sha256').hexdigest()
 
 
+def download(url, path, checksum):
+    """Descarga con progreso y verificación SHA-256; si ya está y coincide, no hace nada."""
+    if path.exists() and digest(path) == checksum:
+        print(f'  ✓ {path.name}'); return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    name = path.name
+    partial = path.with_suffix('.part')
+    with urllib.request.urlopen(url, timeout=120) as response, partial.open('wb') as out:
+        total = int(response.headers.get('Content-Length') or 0)
+        done = 0
+        while block := response.read(8 * 1024 * 1024):
+            out.write(block)
+            done += len(block)
+            if total: print(f'\r  {name}: {done * 100 // total}%', end='', flush=True)
+    print()
+    if digest(partial) != checksum:
+        partial.unlink()
+        raise SystemExit(f'La suma de verificación de {name} no coincide; vuelve a intentarlo.')
+    partial.replace(path)
+
+
 def models():
     from cati.config import DATA, MODEL_REVISION
     step('Modelo local EmbeddingGemma 2 (≈865 MB, se descarga una vez)')
-    folder = DATA / 'models'
-    folder.mkdir(parents=True, exist_ok=True)
     for name, checksum in MODELS:
-        path = folder / name
-        if path.exists() and digest(path) == checksum:
-            print(f'  ✓ {name}'); continue
-        partial = path.with_suffix('.part')
-        with urllib.request.urlopen(f'{MODEL_REPO}/{MODEL_REVISION}/{name}', timeout=120) as response, partial.open('wb') as out:
-            total = int(response.headers.get('Content-Length') or 0)
-            done = 0
-            while block := response.read(8 * 1024 * 1024):
-                out.write(block)
-                done += len(block)
-                if total: print(f'\r  {name}: {done * 100 // total}%', end='', flush=True)
-        print()
-        if digest(partial) != checksum:
-            partial.unlink()
-            raise SystemExit(f'La suma de verificación de {name} no coincide; vuelve a intentarlo.')
-        partial.replace(path)
+        download(f'{MODEL_REPO}/{MODEL_REVISION}/{name}', DATA / 'models' / name, checksum)
+
+
+def voice(gpu):
+    """whisper.cpp para la búsqueda por voz: con Vulkan usa large-v3-turbo; en CPU, small (más ligero)."""
+    from cati import doctor
+    from cati.config import DATA
+    step('Voz (whisper.cpp)')
+    backend = 'vulkan' if gpu != 'cpu' and (doctor.vulkan_ok() or (ROOT / 'build/whisper-vulkan/bin/whisper-server').exists()) else 'cpu'
+    build = ROOT / f'build/whisper-{backend}'
+    if all((build / 'bin' / tool).exists() for tool in ('whisper-cli', 'whisper-server')):
+        print(f'  ✓ whisper.cpp ({backend})')
+    else:
+        source = ROOT / 'build/whisper.cpp'
+        if not source.exists():
+            run(['git', 'clone', '--quiet', '--depth', '1', '--branch', WHISPER_TAG, 'https://github.com/ggml-org/whisper.cpp', str(source)])
+        if subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip() != WHISPER_COMMIT:
+            raise SystemExit('La copia de whisper.cpp no coincide con la versión probada.')
+        print(f'  Compilando whisper.cpp ({backend})…', flush=True)
+        flags = ['-DGGML_VULKAN=ON'] if backend == 'vulkan' else ['-DGGML_NATIVE=ON']
+        run(['cmake', '-S', str(source), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release', '-DWHISPER_BUILD_TESTS=OFF',
+             '-DWHISPER_SDL2=OFF', *flags], stdout=subprocess.DEVNULL)
+        run(['cmake', '--build', str(build), '--target', 'whisper-cli', 'whisper-server', '-j', str(max(1, min(os.cpu_count() or 2, 8)))],
+            stdout=subprocess.DEVNULL)
+    name, checksum = WHISPER_MODELS[backend]
+    download(f'{WHISPER_REPO}/{name}', DATA / 'models' / name, checksum)
 
 
 def built(backend):
@@ -220,6 +254,7 @@ def install(args):
         key.write_text(secrets.token_urlsafe(32) + '\n'); key.chmod(0o600)
     models()
     engine(args.gpu)
+    if not args.no_voice: voice(args.gpu)
     fonts()
     step('Integración con el escritorio')
     from cati.desktop import integrate
@@ -257,6 +292,7 @@ def main():
     parser.add_argument('--gpu', choices=['auto', 'vulkan', 'cpu'], default='auto', help='aceleración del motor (por defecto: auto)')
     parser.add_argument('--shortcut', help='atajo, p. ej. "SUPER ALT, U" (Hyprland) o "<Super><Alt>u" (GNOME)')
     parser.add_argument('--no-shortcut', action='store_true', help='no configurar atajo de teclado')
+    parser.add_argument('--no-voice', action='store_true', help='no instalar la búsqueda por voz')
     parser.add_argument('--uninstall', action='store_true', help='retira Cati del sistema')
     parser.add_argument('--purge', action='store_true', help='con --uninstall, borra también índice, modelos y ajustes')
     args = parser.parse_args()

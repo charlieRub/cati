@@ -46,6 +46,8 @@ SUGGESTIONS = ['documento html de pirámides', 'fotos de esta semana', 'pdfs en 
 SEARCH, COG, CAMERA, EXACT = '\U000F0349', '\U000F0493', '\U000F0100', '\U000F0B34'
 OPEN, FOLDER_OPEN, COPY, LEFT, RIGHT = '\U000F03CC', '\U000F0770', '\U000F018F', '\U000F0141', '\U000F0142'
 INFO = '\U000F02FD'
+MIC, RENAME, MOVE, TRASH, UNDO, MORE = '\U000F036C', '\U000F0CB6', '\U000F0255', '\U000F0A7A', '\U000F054C', '\U000F01D9'
+BARS = '▁▂▃▄▅▆▇█'
 TEXT_PREVIEW = {'document', 'code'}
 MEDIA_EXTS = {'.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.mp3', '.wav', '.m4a', '.flac', '.ogg', '.opus', '.aac'}
 
@@ -93,6 +95,14 @@ def css(c):
     button.tool:hover {{ color: {c['foreground']}; border-color: {c['color8']}; }}
     button.tool:checked {{ color: {c['background']}; background: {c['accent']}; border-color: {c['accent']}; }}
     .spinner {{ color: {c['accent']}; margin-right: 8px; }}
+    button.tool.listening {{ color: {c['background']}; background: {c['red']}; border-color: {c['red']}; }}
+    .meter {{ color: {c['red']}; font-size: 16px; margin-right: 10px; }}
+    menubutton.action > button {{ all: unset; padding: 5px 10px; border: 1px solid {c['color8']}; color: {c['foreground']}; margin-right: 8px; }}
+    menubutton.action > button:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
+    button.undo {{ color: {c['accent']}; border: 1px solid {c['accent']}; padding: 1px 10px; margin-left: 10px; font-size: 12px; }}
+    popover.menu contents {{ background: {c['lighter_background']}; border: 1px solid {c['color8']}; border-radius: 0; }}
+    popover.menu modelbutton {{ color: {c['foreground']}; padding: 6px 12px; }}
+    popover.menu modelbutton:hover {{ background: {c['selection']}; }}
 
     .filters {{ padding: 9px 20px; border-bottom: 1px solid {c['color8']}; background: {c['background']}; }}
     button.chip {{ padding: 3px 10px; margin-right: 6px; color: {c['muted']}; border: 1px solid {c['color8']}; font-size: 12px; }}
@@ -323,6 +333,16 @@ class Cati(Gtk.Application):
         self.current = None
         self.searching = False
         self.stats = {}
+        self.voice_on_start = False
+        self.listening = None
+        self.undo = None
+        voice = Gio.SimpleAction.new('voice', None)
+        voice.connect('activate', lambda *_: self.voice())
+        self.add_action(voice)
+        for name, callback in (('rename', lambda *_: self.rename()), ('move', lambda *_: self.move_to()), ('trash', lambda *_: self.trash())):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect('activate', callback)
+            self.add_action(action)
         self.connect('activate', self.activate)
         self.connect('shutdown', self.shutdown_pools)
 
@@ -344,6 +364,9 @@ class Cati(Gtk.Application):
         self.poll()
         if not self.background: self.show()
         self.background = False
+        if self.voice_on_start:
+            self.voice_on_start = False
+            self.voice()
 
     def apply_theme(self):
         """Relee la paleta: un cambio de tema en Omarchy se ve al volver a abrir Cati."""
@@ -396,6 +419,10 @@ class Cati(Gtk.Application):
         bar.append(self.entry)
         self.spinner = label('', 'spinner')
         bar.append(self.spinner)
+        self.meter = label('', 'meter')
+        bar.append(self.meter)
+        self.mic = button(MIC, 'tool', lambda *_: self.voice(), 'Buscar hablando (Super+Alt+V, o Alt+V con Cati abierto)')
+        bar.append(self.mic)
         self.exact = button(EXACT, 'tool', lambda *_: self.search_now(), 'Solo palabras exactas (sin modelo)', toggle=True)
         bar.append(self.exact)
         bar.append(button(CAMERA, 'tool', self.choose_image, 'Buscar imágenes parecidas a una foto (o arrástrala aquí)'))
@@ -438,7 +465,7 @@ class Cati(Gtk.Application):
         footer.append(self.dot)
         self.status = label('Cargando índice…', hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         footer.append(self.status)
-        for key, text in [('↑↓', 'navegar'), ('⏎', 'abrir'), ('Ctrl ⏎', 'carpeta'), ('Ctrl C', 'copiar ruta'), ('Tab', 'tipo'), ('Esc', 'cerrar')]:
+        for key, text in [('↑↓', 'navegar'), ('⏎', 'abrir'), ('Ctrl ⏎', 'carpeta'), ('Alt V', 'voz'), ('Tab', 'tipo'), ('Esc', 'cerrar')]:
             footer.append(label(key, 'kbd'))
             footer.append(label(text))
         root.append(footer)
@@ -479,6 +506,16 @@ class Cati(Gtk.Application):
         if ctrl and key in {Gdk.KEY_c, Gdk.KEY_C} and self.current and not self.entry.get_selection_bounds():
             self.copy_path(self.current)
             return True
+        if alt and key in {Gdk.KEY_v, Gdk.KEY_V}:
+            self.voice(); return True
+        if key == Gdk.KEY_F2 and self.current:
+            self.rename(); return True
+        if ctrl and key in {Gdk.KEY_m, Gdk.KEY_M} and self.current:
+            self.move_to(); return True
+        if ctrl and key == Gdk.KEY_Delete and self.current:
+            self.trash(); return True
+        if ctrl and key in {Gdk.KEY_z, Gdk.KEY_Z} and self.undo and not self.entry.get_text():
+            self.undo_action(); return True
         if ctrl and key == Gdk.KEY_comma:
             self.settings()
             return True
@@ -852,6 +889,13 @@ class Cati(Gtk.Application):
         info.append(label('Alt ⏎', 'key'))
         self.props_button = button(info, 'action', self.toggle_properties, toggle=True)
         actions.append(self.props_button)
+        menu = Gio.Menu()
+        menu.append('Renombrar (F2)', 'app.rename')
+        menu.append('Mover a otra carpeta (Ctrl+M)', 'app.move')
+        menu.append('Mover a la papelera (Ctrl+Supr)', 'app.trash')
+        more = Gtk.MenuButton(menu_model=menu, css_classes=['action'], tooltip_text='Más acciones')
+        more.set_child(label(MORE))
+        actions.append(more)
         self.toolbar = Gtk.Box(hexpand=True, halign=Gtk.Align.END)
         actions.append(self.toolbar)
         self.preview_box.append(actions)
@@ -1363,6 +1407,9 @@ class Cati(Gtk.Application):
 
     def update_status(self, state, files, names, active):
         self.stats = {'files': files, 'names': names}
+        history = getattr(self, 'history', [])
+        history.append((time.monotonic(), files, state.get('queued') or 0))
+        self.history = history = [h for h in history if h[0] > time.monotonic() - 600]
         fmt = lambda n: f'{n:,}'.replace(',', '.')
         parts = [f'{fmt(names)} elementos por nombre', f'{fmt(files)} con contenido analizado']
         for name in ('dot', 'busy', 'off'): self.dot.remove_css_class(name)
@@ -1374,12 +1421,187 @@ class Cati(Gtk.Application):
             self.dot.add_css_class('busy'); parts.append('revisando carpetas…')
         elif state.get('queued'):
             self.dot.add_css_class('busy')
-            parts.append(f"{fmt(state['queued'])} en cola de análisis")
+            text = f"{fmt(state['queued'])} en cola de análisis"
+            span = history[-1][0] - history[0][0]
+            done = history[0][2] - history[-1][2]
+            if span > 60 and done > 0:
+                # Rate from the last ten minutes; copies and quick text files make the queue shrink faster than files grow.
+                remaining = state['queued'] / (done / span)
+                hours, minutes = int(remaining // 3600), int(remaining % 3600 // 60)
+                text += f", unas {hours} h {minutes} min" if hours else f", unos {max(minutes, 1)} min"
+            parts.append(text)
         else:
             parts.append('todo al día, vigilando cambios')
         if state.get('error'): parts.append(state['error'])
         self.status.set_text(', '.join(parts))
         return False
+
+    # ---------------------------------------------------------------- voz
+    def voice(self):
+        """Pulsar para hablar: graba hasta que te callas, transcribe en local y busca u obedece."""
+        if self.window is None:
+            self.voice_on_start = True
+            return
+        if self.listening is not None:
+            self.listening.set()  # second press: stop and transcribe what was said
+            return
+        from . import voice as speech
+        self.show()
+        self.listening = stop = threading.Event()
+        self.mic.add_css_class('listening')
+        self.entry.set_text('')
+        self.entry.set_placeholder_text('Te escucho… di lo que buscas o una orden como «abre el segundo»')
+        levels = []
+        # The model loads while you speak, so the first phrase is as quick as the rest.
+        threading.Thread(target=lambda: self.safe(speech.server().ensure), daemon=True).start()
+
+        def level(value, speaking):
+            levels.append(value)
+            del levels[:-6]
+            GLib.idle_add(lambda: (self.meter.set_text(''.join(BARS[min(7, int(v * 7.99))] for v in levels)), False)[1])
+
+        def work():
+            try:
+                audio = speech.record(stop, level)
+                GLib.idle_add(lambda: (self.entry.set_placeholder_text('Transcribiendo…'), self.meter.set_text(''), False)[2])
+                return speech.command(speech.transcribe(audio)) if audio else None
+            except speech.NoMicrophone as exc:
+                return ('error', 'Conecta un micrófono', f'{exc}. Cuando lo conectes, pulsa Super+Alt+V o el botón del micrófono y habla.')
+            except speech.NotHeard:
+                return ('error', 'No te he oído', 'Pulsa el micrófono y habla justo después; se detiene solo cuando te callas.')
+            except Exception as exc:
+                return ('error', 'No se pudo usar la voz', str(exc))
+
+        def done(future):
+            GLib.idle_add(self.voice_result, future.result())
+        self.preview_pool.submit(work).add_done_callback(done)
+
+    @staticmethod
+    def safe(callback):
+        try: callback()
+        except Exception: pass
+
+    def voice_result(self, result):
+        self.listening = None
+        self.mic.remove_css_class('listening')
+        self.meter.set_text('')
+        self.entry.set_placeholder_text('Describe lo que buscas: «documento html de pirámides», «fotos de ayer»…')
+        if not result: return False
+        action, *args = result
+        if action == 'error':
+            self.empty_preview(*args); return False
+        if action == 'search':
+            self.entry.set_text(args[0]); self.entry.set_position(-1)
+        elif action == 'open':
+            target = self.nth(args[0])
+            if target: self.open_hit(target)
+        elif action == 'folder' and self.current: self.open_hit(self.current, folder=True)
+        elif action == 'properties' and self.shown: self.props_button.set_active(not self.props_button.get_active())
+        elif action == 'move': self.move(args[0])
+        elif action == 'copy' and self.current: self.copy_path(self.current)
+        elif action == 'trash' and self.current: self.trash()
+        elif action == 'close': self.hide()
+        return False
+
+    def nth(self, number):
+        """Resultado n-ésimo visible (1 = primero, -1 = último, 0 = el seleccionado)."""
+        if number == 0: return self.current
+        rows = []
+        child = self.results.get_first_child()
+        while child:
+            if hasattr(child, 'hit'): rows.append(child)
+            child = child.get_next_sibling()
+        if not rows: return None
+        row = rows[number - 1] if 0 < number <= len(rows) else rows[-1] if number == -1 else None
+        if row: self.results.select_row(row)
+        return row.hit if row else None
+
+    # ---------------------------------------------------------- archivos
+    def rename(self):
+        hit = self.current
+        if not hit: return
+        path = Path(hit['path'])
+        dialog = Gtk.Window(title='Renombrar', transient_for=self.window, modal=True, decorated=False)
+        dialog.add_css_class('cati-dialog')
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=['panel'])
+        box.append(label(f'{RENAME}  Renombrar', 'heading'))
+        entry = Gtk.Entry(text=path.name, width_chars=48)
+        box.append(entry)
+        problem = label('', 'problem', wrap=True)
+        box.append(problem)
+        dialog.set_child(box)
+
+        def apply(*_):
+            name = entry.get_text().strip()
+            if not name or '/' in name: problem.set_text('Escribe un nombre sin «/».'); return
+            target = path.with_name(name)
+            if target.exists(): problem.set_text('Ya existe un archivo con ese nombre.'); return
+            try: path.rename(target)
+            except OSError as exc: problem.set_text(str(exc)); return
+            dialog.destroy()
+            self.after_change(f'Renombrado a {name}', lambda: target.rename(path))
+        entry.connect('activate', apply)
+        keys = Gtk.EventControllerKey()
+        keys.connect('key-pressed', lambda c, k, *_: (dialog.destroy(), True)[1] if k == Gdk.KEY_Escape else False)
+        dialog.add_controller(keys)
+        dialog.present()
+        stem = len(path.stem) if path.suffix and not path.is_dir() else len(path.name)
+        entry.grab_focus(); entry.select_region(0, stem)
+
+    def move_to(self):
+        hit = self.current
+        if not hit: return
+        path = Path(hit['path'])
+        chooser = Gtk.FileDialog(title=f'Mover «{path.name}» a…', accept_label='Mover aquí')
+        chooser.set_initial_folder(Gio.File.new_for_path(str(path.parent)))
+
+        def finished(chooser, result):
+            try: folder = chooser.select_folder_finish(result)
+            except GLib.Error: return
+            target = Path(folder.get_path()) / path.name
+            if target.exists(): self.timing.set_text('Ya existe un archivo con ese nombre allí'); return
+            import shutil
+            try: shutil.move(str(path), str(target))
+            except OSError as exc: self.timing.set_text(str(exc)); return
+            self.after_change(f'Movido a {short_path(target.parent)}', lambda: shutil.move(str(target), str(path)))
+        chooser.select_folder(self.window, None, finished)
+
+    def trash(self):
+        hit = self.current
+        if not hit: return
+        path = Path(hit['path'])
+        try: Gio.File.new_for_path(str(path)).trash(None)
+        except GLib.Error as exc:
+            self.timing.set_text(f'No se pudo mover a la papelera: {exc.message}'); return
+        self.after_change(f'«{path.name}» está en la papelera', lambda: restore(path))
+
+    def after_change(self, message, undo):
+        """Refresca los resultados y ofrece deshacer durante diez segundos."""
+        self.undo = (message, undo)
+        self.timing.set_text(message)
+        self.clear(self.tags)
+        self.tags.append(button(f'{UNDO}  Deshacer (Ctrl+Z)', 'undo', lambda *_: self.undo_action()))
+        GLib.timeout_add_seconds(10, self.expire_undo, self.undo)
+        self.shown = None
+        GLib.timeout_add(400, lambda: (self.search_now() if self.entry.get_text().strip() else self.show_recent(), False)[1])
+
+    def expire_undo(self, token):
+        if self.undo is token:
+            self.undo = None
+            self.clear(self.tags)
+        return False
+
+    def undo_action(self):
+        if not self.undo: return
+        message, undo = self.undo
+        self.undo = None
+        self.clear(self.tags)
+        try:
+            undo()
+            self.timing.set_text('Deshecho')
+        except Exception as exc:
+            self.timing.set_text(f'No se pudo deshacer: {exc}')
+        GLib.timeout_add(400, lambda: (self.search_now() if self.entry.get_text().strip() else self.show_recent(), False)[1])
 
     # ------------------------------------------------------------- ajustes
     def settings(self, *_):
@@ -1509,5 +1731,31 @@ class _Done:
         return self.value
 
 
-def run(background=False):
-    Cati(background).run(None)
+def restore(original):
+    """Devuelve a su sitio el último elemento enviado a la papelera desde esa ruta."""
+    from urllib.parse import unquote
+    trash = Path(GLib.get_user_data_dir()) / 'Trash'
+    candidates = []
+    for info in (trash / 'info').glob('*.trashinfo'):
+        text = info.read_text(errors='replace')
+        match = re.search(r'^Path=(.+)$', text, re.M)
+        if match and unquote(match[1]) == str(original):
+            candidates.append((info.stat().st_mtime, info))
+    if not candidates: raise RuntimeError('ya no está en la papelera')
+    info = max(candidates)[1]
+    stored = trash / 'files' / info.name.removesuffix('.trashinfo')
+    if original.exists(): raise RuntimeError('ya existe otro archivo con ese nombre')
+    stored.rename(original)
+    info.unlink()
+
+
+def run(background=False, voice=False):
+    app = Cati(background)
+    if voice:
+        # Already running: ask the resident instance to listen and return at once.
+        app.register(None)
+        if app.get_is_remote():
+            app.activate_action('voice', None)
+            return
+        app.voice_on_start = True
+    app.run(None)

@@ -148,7 +148,7 @@ class Watcher:
                 for path in old:
                     if path not in selected and not Path(path).exists():db.execute('DELETE FROM files WHERE path=?',(path,))
                     elif not self.permitted(Path(path)) or file_kind(Path(path),self.config['code']) is None:db.execute('DELETE FROM files WHERE path=?',(path,))
-            options=reader_options(self.config)
+            options={kind:reader_options(self.config,kind) for kind in ('document','pdf','image','audio','video','code')}
             groups=defaultdict(list)
             for path,kind in candidates:
                 if path in stats:mtime,size=stats[path]
@@ -157,7 +157,7 @@ class Watcher:
                     except OSError:continue
                     mtime,size=info.st_mtime_ns,info.st_size
                 row=old.get(str(path))
-                same=row and row['mtime']==mtime and row['size']==size and row['kind']==kind and row['options']==options and not row['error']
+                same=row and row['mtime']==mtime and row['size']==size and row['kind']==kind and row['options']==options[kind] and not row['error']
                 if not same:groups[kind].append((mtime,path))
                 elif not row['complete']:self.enqueue(path,20)
             # Fair first pass: a photo is scheduled between documents and PDF jobs.

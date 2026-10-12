@@ -13,9 +13,11 @@ from .readers import walk, extract, cache_thumbnail
 from .store import connect
 
 
-def reader_options(config):
-    options = {k:config.get(k) for k in ['media','video_stride','max_file_mb','max_text_mb','max_pdf_pages']}
-    return hashlib.sha256(json.dumps(options | {'readers':3},sort_keys=True).encode()).hexdigest()
+def reader_options(config, kind=None):
+    options = {k:config.get(k) for k in ['media','video_stride','max_file_mb','max_text_mb','max_pdf_pages']} | {'readers':3}
+    # Documents and PDFs gained embedded images and more formats; other kinds keep their analysis.
+    if kind in {'document', 'pdf'}: options['documents'] = 2
+    return hashlib.sha256(json.dumps(options,sort_keys=True).encode()).hexdigest()
 
 
 def fingerprint(path, size):
@@ -65,7 +67,7 @@ def write_status(state):
 def index(config=None, stop=None, notify=None, db_path=None, engine=None,
           candidates=None, max_segments=None, time_budget=None, report_status=True, locked=False):
     config = config or load()
-    options = reader_options(config)
+    all_options = {}
     supplied = candidates is not None
     # The watcher holds the lock for its whole life and runs several jobs at once.
     with (contextlib.nullcontext() if locked else lock_path(db_path).open('a')) as lock:
@@ -102,6 +104,7 @@ def index(config=None, stop=None, notify=None, db_path=None, engine=None,
                         with db: db.execute('DELETE FROM files WHERE path=?',(str(path),))
                         continue
                     stat = path.stat()
+                    options = all_options.setdefault(kind, reader_options(config, kind))
                     old = db.execute('SELECT * FROM files WHERE path=?',(str(path),)).fetchone()
                     same = bool(old and not old['error'] and old['kind']==kind and old['options']==options
                                 and old['mtime']==stat.st_mtime_ns and old['size']==stat.st_size)

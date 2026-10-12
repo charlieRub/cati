@@ -29,8 +29,10 @@ REQUIREMENTS = {
     'tools': ('xdg-open y file', True, {
         'arch': 'xdg-utils file', 'debian': 'xdg-utils file', 'fedora': 'xdg-utils file', 'suse': 'xdg-utils file'}),
     'vulkan': ('Aceleración por GPU con Vulkan', False, {
-        'arch': 'vulkan-headers vulkan-icd-loader shaderc', 'debian': 'libvulkan-dev glslc', 'fedora': 'vulkan-headers vulkan-loader-devel glslc',
-        'suse': 'vulkan-devel shaderc'}),
+        'arch': 'vulkan-headers vulkan-icd-loader shaderc spirv-headers', 'debian': 'libvulkan-dev glslc spirv-headers',
+        'fedora': 'vulkan-headers vulkan-loader-devel glslc spirv-headers-devel', 'suse': 'vulkan-devel shaderc spirv-headers'}),
+    'microphone': ('Grabación del micrófono para buscar por voz', False, {
+        'arch': 'libpulse', 'debian': 'pulseaudio-utils', 'fedora': 'pulseaudio-utils', 'suse': 'pulseaudio-utils'}),
     'metadata': ('ExifTool para ver todos los metadatos (EXIF, XMP, IPTC, GPS, ID3…)', False, {
         'arch': 'perl-image-exiftool', 'debian': 'libimage-exiftool-perl', 'fedora': 'perl-Image-ExifTool', 'suse': 'exiftool'}),
     'browser': ('Chromium para la vista previa de páginas HTML', False, {
@@ -89,6 +91,7 @@ def check():
         'tools': bool(have('xdg-open') and have('file')),
         'vulkan': vulkan_ok(),
         'metadata': bool(have('exiftool')),
+        'microphone': bool(have('parecord') or have('arecord')),
         'browser': bool(have('chromium') or have('chromium-browser') or have('google-chrome-stable')),
     }
 
