@@ -259,6 +259,15 @@ class Searcher:
                 if entry['z'] > folder['z']: folder.update(z=entry['z'], sid=entry['sid'])
         return best, folders
 
+    def file_stats(self, path):
+        """Qué sabe el índice de un archivo: fragmentos, tipos y si el análisis terminó."""
+        with self.lock:
+            row = self.db.execute('SELECT id,complete FROM files WHERE path=? AND error IS NULL', (str(path),)).fetchone()
+            if not row: return None
+            segments = self.db.execute('SELECT kind,count(*) FROM segments WHERE file=? GROUP BY kind', (row['id'],)).fetchall()
+        return {'segments': sum(n for _, n in segments), 'kinds': [k for k, _ in segments], 'complete': bool(row['complete']),
+                'indexed': None}
+
     def recent(self, limit=40):
         """Archivos modificados más recientemente: lo que aparece antes de escribir."""
         with self.lock:

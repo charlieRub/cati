@@ -14,8 +14,8 @@ from inotify_simple import INotify, flags
 from . import catalog
 from .config import DATA,load
 from .engine import Engine
-from .indexer import index,lock_path,reader_options,write_status
-from .readers import walk,file_kind,allowed,SKIP_DIRS
+from .indexer import fingerprint,index,lock_path,reader_options,write_status
+from .readers import walk,file_kind,allowed,release_ocr,SKIP_DIRS
 from .scope import resolved
 from .store import connect
 
@@ -124,8 +124,21 @@ class Watcher:
         self.active_config=resolved(self.config)
         db=connect(self.db_path)
         try:
-            self.catalog_size=catalog.sync(db,self.active_config['folders'],self.config['exclude'],self.stop,self.watch_directory)
-            candidates=list(walk(self.active_config,stop=self.stop))
+            seen=[]
+            self.catalog_size=catalog.sync(db,self.active_config['folders'],self.config['exclude'],self.stop,self.watch_directory,seen)
+            if self.stop.is_set():return
+            stats={}
+            if self.config['code'] or self.config.get('project_screenshots_only') or self.config.get('skip_datasets'):
+                # Project and dataset rules need the dedicated walk.
+                candidates=list(walk(self.active_config,stop=self.stop))
+            else:
+                # One pass over the disk: the catalog walk already applied the same visibility rules.
+                media=self.config['media']
+                candidates=[]
+                for path,size,mtime in seen:
+                    kind=file_kind(path)
+                    if kind and (media or kind not in {'image','audio','video'}):
+                        candidates.append((path,kind));stats[path]=(mtime,size)
             if self.stop.is_set():return
             old={row['path']:dict(row) for row in db.execute('SELECT * FROM files')}
             selected={str(p) for p,_ in candidates}
@@ -138,11 +151,14 @@ class Watcher:
             options=reader_options(self.config)
             groups=defaultdict(list)
             for path,kind in candidates:
-                try:stat=path.stat()
-                except OSError:continue
+                if path in stats:mtime,size=stats[path]
+                else:
+                    try:info=path.stat()
+                    except OSError:continue
+                    mtime,size=info.st_mtime_ns,info.st_size
                 row=old.get(str(path))
-                same=row and row['mtime']==stat.st_mtime_ns and row['size']==stat.st_size and row['kind']==kind and row['options']==options and not row['error']
-                if not same:groups[kind].append((stat.st_mtime_ns,path))
+                same=row and row['mtime']==mtime and row['size']==size and row['kind']==kind and row['options']==options and not row['error']
+                if not same:groups[kind].append((mtime,path))
                 elif not row['complete']:self.enqueue(path,20)
             # Fair first pass: a photo is scheduled between documents and PDF jobs.
             ordered=[deque(p for _,p in sorted(groups[k],reverse=True)) for k in ['document','pdf','image','audio','video','code'] if groups[k]]
@@ -154,12 +170,28 @@ class Watcher:
             self.error=None
         finally:db.close()
 
+    def backfill(self):
+        """Huella de archivos ya analizados antes de existir la deduplicación (una vez, por lotes)."""
+        db=connect(self.db_path)
+        try:
+            while not self.stop.is_set():
+                rows=db.execute('SELECT id,path,size FROM files WHERE fingerprint IS NULL AND complete=1 AND error IS NULL LIMIT 200').fetchall()
+                if not rows:return
+                updates=[]
+                for row in rows:
+                    try:updates.append((fingerprint(row['path'],row['size']),row['id']))
+                    except OSError:updates.append(('missing',row['id']))
+                with db:db.executemany('UPDATE files SET fingerprint=? WHERE id=?',updates)
+        finally:db.close()
+
     def scans(self):
         while not self.stop.is_set():
             if self.rescan.wait(timeout=max(10,self.config.get('scan_seconds',300))):self.rescan.clear()
             if self.stop.is_set():return
-            try:self.scan()
-            except Exception as exc:self.error=f'Exploración: {exc}'
+            try:self.scan();self.backfill()
+            except Exception as exc:
+                self.error=f'Exploración: {exc}'
+                self.stop.wait(60);self.rescan.set()  # retry soon instead of waiting for the next periodic scan
             # Coalesce repeated new-directory notifications without losing them.
             self.stop.wait(2)
 
@@ -219,9 +251,12 @@ class Watcher:
         threads+=[threading.Thread(target=self.work,args=(f'w{i}',),daemon=True) for i in range(self.workers())]
         for thread in threads:thread.start()
         try:
+            idle=0
             while not self.stop.is_set():
                 self.report()
                 self.stop.wait(1)
+                idle=idle+1 if not self.working and not self.pending else 0
+                if idle==60:release_ocr()  # nothing queued for a minute: give the OCR memory back
         finally:
             self.stop.set()
             self.rescan.set()

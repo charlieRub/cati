@@ -33,8 +33,13 @@ Todo ocurre en tu equipo: no hay nube, cuentas ni telemetría.
   - vídeo y audio que se reproducen desde el instante relevante;
   - código y Markdown con sintaxis coloreada y tus palabras resaltadas;
   - carpetas con cuadrícula de fotos.
+- **Propiedades completas.** Con *Propiedades* (Alt + Enter o clic derecho) ves fechas (incluida la de creación), permisos, propietario, cámara, objetivo y GPS de las fotos, autor y páginas de los PDF, códecs de vídeo y audio, autor de documentos de Office y, con ExifTool instalado, todos los metadatos EXIF, XMP, IPTC, QuickTime o ID3. Un clic en cualquier valor lo copia.
 - **Ordena con criterio.** Combina nombre, palabras y significado, agrupa copias y versiones repetidas («+2 copias») y premia el archivo cuyo nombre contiene lo que escribiste.
-- **Ligera.** La interfaz queda residente con unos 130 MB y se abre al instante. El modelo se descarga de memoria tras 15 minutos sin uso, y el análisis trabaja con prioridad baja y usa un solo hilo con batería.
+- **Ligera y rápida analizando.**
+  - Las copias exactas (backups, descargas repetidas) se analizan una sola vez; en un equipo real eran un 34 % de los archivos.
+  - Los embeddings usan la GPU por Vulkan (AMD, NVIDIA o Intel) y, si no hay, la CPU. En equipos NVIDIA el OCR también va por GPU.
+  - El análisis solo aprovecha CPU que nadie más usa, con disco en modo inactivo y tope de memoria, y en portátiles con batería baja a un solo trabajo.
+  - La interfaz queda residente con unos 130 MB. El modelo y el OCR liberan su memoria cuando no se usan.
 
 ## Instalación
 
@@ -77,11 +82,12 @@ En GNOME configura el atajo automáticamente. En KDE lo propone en la entrada de
 | Tecla | Acción |
 | --- | --- |
 | Escribir | Buscar (no hace falta pulsar Enter) |
-| ↑ ↓ · RePág AvPág | Moverse por los resultados |
+| ↑ ↓, RePág, AvPág | Moverse por los resultados |
 | Enter | Abrir (PDF en su página, vídeo en su instante) |
 | Ctrl + Enter | Mostrar en su carpeta |
 | Ctrl + C | Copiar el archivo y su ruta |
-| Tab · Shift + Tab | Cambiar de tipo (Todo, Carpetas, Documentos, Imágenes…) |
+| Tab, Shift + Tab | Cambiar de tipo (Todo, Carpetas, Documentos, Imágenes…) |
+| Alt + Enter, clic derecho | Propiedades y metadatos |
 | Alt + ← → | Página anterior o siguiente en PDF |
 | Esc | Cerrar (Cati sigue residente) |
 

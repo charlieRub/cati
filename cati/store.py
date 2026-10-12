@@ -3,6 +3,15 @@ from contextlib import contextmanager
 from .config import DATA, FINGERPRINT
 
 
+def add_column(db, table, column, definition):
+    """Idempotente aunque otra conexión migre a la vez."""
+    if column in {row[1] for row in db.execute(f'PRAGMA table_info({table})')}: return
+    try:
+        db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+    except sqlite3.OperationalError as exc:
+        if 'duplicate column' not in str(exc): raise
+
+
 def connect(path=None, threads=False):
     path = path or DATA / "index.sqlite3"
     db = sqlite3.connect(path, timeout=30, check_same_thread=not threads)
@@ -21,12 +30,10 @@ def connect(path=None, threads=False):
               DELETE FROM words WHERE rowid=old.id;
             END;
         """)
-        columns = {row[1] for row in db.execute('PRAGMA table_info(files)')}
-        if 'options' not in columns: db.execute("ALTER TABLE files ADD COLUMN options TEXT NOT NULL DEFAULT ''")
-        if 'complete' not in columns: db.execute('ALTER TABLE files ADD COLUMN complete INTEGER NOT NULL DEFAULT 1')
-        if 'cursor' not in columns: db.execute("ALTER TABLE files ADD COLUMN cursor TEXT NOT NULL DEFAULT '[0,0]'")
-        segment_columns = {row[1] for row in db.execute('PRAGMA table_info(segments)')}
-        if 'sets_scale' not in segment_columns: db.execute('ALTER TABLE segments ADD COLUMN sets_scale INTEGER NOT NULL DEFAULT 1')
+        add_column(db, 'files', 'options', "TEXT NOT NULL DEFAULT ''")
+        add_column(db, 'files', 'complete', 'INTEGER NOT NULL DEFAULT 1')
+        add_column(db, 'files', 'cursor', "TEXT NOT NULL DEFAULT '[0,0]'")
+        add_column(db, 'segments', 'sets_scale', 'INTEGER NOT NULL DEFAULT 1')
         db.execute('PRAGMA user_version=2')
     if db.execute('PRAGMA user_version').fetchone()[0] < 3:
         # Every file and folder by name, including types whose content is not read.
@@ -50,7 +57,11 @@ def connect(path=None, threads=False):
             END;
             PRAGMA user_version=3;
         """)
-    row =db.execute("SELECT value FROM meta WHERE key='fingerprint'").fetchone()
+    if db.execute('PRAGMA user_version').fetchone()[0] < 4:
+        # Content fingerprint: an exact copy reuses the analysis of the original.
+        add_column(db, 'files', 'fingerprint', 'TEXT')
+        db.executescript('CREATE INDEX IF NOT EXISTS files_fingerprint ON files(fingerprint); PRAGMA user_version=4;')
+    row = db.execute("SELECT value FROM meta WHERE key='fingerprint'").fetchone()
     if row and row[0] != FINGERPRINT:
         db.close()
         raise RuntimeError("Cambió el modelo o los prompts. Reconstruye el índice antes de buscar.")

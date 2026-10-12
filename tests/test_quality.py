@@ -92,6 +92,23 @@ class Quality(unittest.TestCase):
             for a,b in zip(made,full):
                 self.assertGreater(float(np.frombuffer(a,'<f4')@np.frombuffer(b,'<f4')),.9995)
 
+    def test_exact_copy_reuses_analysis_without_the_engine(self):
+        with tempfile.TemporaryDirectory() as work:
+            root=Path(work);db=root/'index.sqlite3'
+            original=root/'IMG_0001.jpg';copy=root/'copia de la foto.jpg'
+            shutil.copyfile(FIXTURES/'IMG_0001.jpg',original);shutil.copyfile(FIXTURES/'IMG_0001.jpg',copy)
+            config=self.config|{'folders':[str(root)]}
+            index(config,db_path=db,engine=self.engine,candidates=[(original,'image')],report_status=False)
+            class NoEngine:
+                def media(self,*_):raise AssertionError('la copia no debe recalcularse')
+                text=media
+            state=index(config,db_path=db,engine=NoEngine(),candidates=[(copy,'image')],report_status=False)
+            self.assertEqual(state.get('reused'),1)
+            with opened(db) as connection:
+                vectors=[[r[0] for r in connection.execute('SELECT s.vec FROM segments s JOIN files f ON f.id=s.file WHERE f.path=? ORDER BY s.id',(str(p),))]
+                         for p in (original,copy)]
+            self.assertTrue(vectors[0]);self.assertEqual(vectors[0],vectors[1])
+
     def test_real_inotify_create_modify_move_and_delete(self):
         with tempfile.TemporaryDirectory() as work:
             root=Path(work);db=root/'index.sqlite3';path=root/'new.txt'

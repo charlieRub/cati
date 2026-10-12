@@ -7,7 +7,7 @@ from .config import DATA, prepare, load, save
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="cati", description="Cati · encuentra cualquier archivo describiéndolo")
+    parser = argparse.ArgumentParser(prog="cati", description="Cati: encuentra cualquier archivo describiéndolo")
     sub = parser.add_subparsers(dest="command")
     gui = sub.add_parser("gui")
     gui.add_argument("--background", action="store_true", help="arranca residente sin mostrar la ventana")

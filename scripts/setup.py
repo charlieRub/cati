@@ -37,7 +37,7 @@ def dependencies(install):
     step('Comprobando dependencias del sistema')
     missing = doctor.report()
     if missing and install:
-        command = doctor.install_command(missing + [n for n, ok in doctor.check().items() if not ok and n in {'gstreamer', 'browser'}])
+        command = doctor.install_command(missing + [n for n, ok in doctor.check().items() if not ok and n in {'gstreamer', 'browser', 'metadata'}])
         if not command: raise SystemExit('No reconozco tu distribución; instala los paquetes indicados arriba.')
         print(f'\nEjecutando: {command}')
         run(command.split())
@@ -55,12 +55,15 @@ def environment():
     python = str(venv / 'bin/python')
     wanted = [('numpy', 'numpy>=2,<3'), ('PIL', 'Pillow>=11,<14'), ('inotify_simple', 'inotify-simple>=2,<3'),
               ('rapidocr', 'rapidocr>=3.10,<4'), ('onnxruntime', 'onnxruntime>=1.20,<2')]
+    if shutil.which('nvidia-smi') and subprocess.run(['nvidia-smi'], capture_output=True).returncode == 0:
+        # NVIDIA: the CUDA build of ONNX Runtime runs the OCR on the GPU as well.
+        wanted[-1] = ('onnxruntime', 'onnxruntime-gpu>=1.20,<2')
     missing = [spec for module, spec in wanted if subprocess.run([python, '-c', f'import {module}'], capture_output=True).returncode]
     if missing: run([python, '-m', 'pip', 'install', '--quiet', *missing])
     # PP-OCR models (≈30 MB) are fetched now rather than during the first indexing job.
     if subprocess.run([python, '-c', 'from cati.readers import rapid; import sys; sys.exit(rapid() is None)'],
                       cwd=ROOT, capture_output=True).returncode:
-        print('  · OCR PP-OCRv6 no disponible en esta arquitectura; se usará Tesseract.')
+        print('  - OCR PP-OCRv6 no disponible en esta arquitectura; se usará Tesseract.')
     return python
 
 
@@ -107,7 +110,7 @@ def engine(gpu):
     source = ROOT / 'build/llama.cpp'
     backends = ['runtime']
     if gpu == 'vulkan' or (gpu == 'auto' and (doctor.vulkan_ok() or built('vulkan'))): backends.append('vulkan')
-    elif gpu == 'auto': print('  · Sin Vulkan: se usará la CPU (instala los extras de Vulkan para acelerar con la GPU).')
+    elif gpu == 'auto': print('  - Sin Vulkan: se usará la CPU (instala los extras de Vulkan para acelerar con la GPU).')
     if not all(built(b) for b in backends):
         if not source.exists():
             run(['git', 'clone', '--quiet', '--depth', '1', '--branch', LLAMA_TAG, 'https://github.com/ggml-org/llama.cpp', str(source)])
@@ -167,7 +170,7 @@ def services():
     executable = str(LAUNCHER).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
     units = {
         'cati-engine.service': f'''[Unit]
-Description=Cati · modelo local de embeddings
+Description=Cati: modelo local de embeddings
 [Service]
 Type=simple
 ExecStart="{executable}" engine
@@ -177,7 +180,7 @@ UMask=0077
 NoNewPrivileges=true
 ''',
         'cati-index.service': f'''[Unit]
-Description=Cati · vigilancia e indexación de archivos
+Description=Cati: vigilancia e indexación de archivos
 Wants=cati-engine.service
 After=cati-engine.service
 [Service]
@@ -185,8 +188,13 @@ Type=simple
 ExecStart="{executable}" watch
 Restart=on-failure
 RestartSec=5
-Nice=10
+# Background only: CPU nobody else wants, idle disk I/O and a soft memory ceiling.
+# Few malloc arenas: threads decoding large images otherwise keep freed memory forever.
+Environment=MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=131072
+Nice=19
+CPUWeight=idle
 IOSchedulingClass=idle
+MemoryHigh=700M
 UMask=0077
 NoNewPrivileges=true
 TimeoutStopSec=60
@@ -215,7 +223,7 @@ def install(args):
     fonts()
     step('Integración con el escritorio')
     from cati.desktop import integrate
-    for note in integrate(shortcut=not args.no_shortcut, binding=args.shortcut): print(f'  · {note}')
+    for note in integrate(shortcut=not args.no_shortcut, binding=args.shortcut): print(f'  - {note}')
     services()
     print('\n\033[1;32m✓ Cati está instalado.\033[0m  Ábrelo con tu atajo, desde el lanzador o con «cati».')
     print('  El primer análisis de tus archivos sigue en segundo plano; los nombres se pueden buscar desde ya.')
@@ -239,7 +247,7 @@ def uninstall(args):
         shutil.rmtree(CONFIG.parent, ignore_errors=True)
         print('  ✓ Índice, modelos y ajustes borrados.')
     else:
-        print('  · El índice y los modelos se conservan; usa --purge para borrarlos.')
+        print('  - El índice y los modelos se conservan; usa --purge para borrarlos.')
     print('\n✓ Cati se ha desinstalado. Puedes borrar esta carpeta.')
 
 

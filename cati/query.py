@@ -61,6 +61,12 @@ LABEL = {'folder': 'Carpetas', 'document': 'Documentos', 'pdf': 'PDF', 'image': 
          'audio': 'Audio', 'sheet': 'Hojas de cálculo', 'slides': 'Presentaciones', 'code': 'Código', 'archive': 'Comprimidos'}
 
 
+def together(items):
+    """«A», «A y B», «A, B y C»."""
+    items = list(items)
+    return items[0] if len(items) == 1 else ', '.join(items[:-1]) + ' y ' + items[-1]
+
+
 def xdg(key, fallback):
     try:
         value = subprocess.check_output(['xdg-user-dir', key], text=True, timeout=2).strip()
@@ -239,10 +245,11 @@ def parse(query, now=None):
         # «documento html»: the extension is stricter than the generic word.
         if intent.categories and intent.categories != {'folder'}:
             intent.categories = None
-        intent.labels.insert(0, ' · '.join(sorted({e[1:].upper() for e in intent.exts})))
+        names = sorted({'HTML' if e in {'.htm', '.html'} else 'JPG' if e in {'.jpg', '.jpeg'} else e[1:].upper() for e in intent.exts})
+        intent.labels.insert(0, together(names))
         if intent.exts == {'.pdf'}: intent.kind_word = intent.kind_word or 'pdf'
     if intent.categories:
-        intent.labels.insert(0, ' · '.join(LABEL[c] for c in sorted(intent.categories)))
+        intent.labels.insert(0, together([LABEL[c] for c in sorted(intent.categories)]))
     intent.terms = list(dict.fromkeys(w for w in content if w not in STOP and w not in EXT_WORDS
                                       and (len(w) >= 2 or w.isdigit())))
     blanked = {owner[i - 1] for i in range(1, len(original) - 1) if text[i] == ' ' and original[i] != ' '}

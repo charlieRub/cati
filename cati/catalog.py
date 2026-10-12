@@ -78,14 +78,16 @@ def row(root, path, is_dir, size, mtime):
     return str(path), name, folders, ext, int(is_dir), size, mtime
 
 
-def sync(db, roots, excluded=(), stop=None, on_directory=None):
-    """Aplica solo las diferencias con el catálogo guardado; devuelve el número de elementos."""
+def sync(db, roots, excluded=(), stop=None, on_directory=None, files=None):
+    """Aplica solo las diferencias con el catálogo guardado; devuelve el número de elementos.
+    Con `files`, acumula (ruta, tamaño, mtime) de cada archivo para no recorrer el disco dos veces."""
     known = {path: (mtime, size) for path, mtime, size in db.execute("SELECT path,mtime,size FROM catalog")}
     seen = set()
     changed = []
     for root, path, is_dir, size, mtime in walk_all(roots, excluded, stop, on_directory):
         key = str(path)
         seen.add(key)
+        if files is not None and not is_dir: files.append((path, size, mtime))
         if known.get(key) != (mtime, size): changed.append(row(root, path, is_dir, size, mtime))
         if len(changed) >= 5000:
             upsert(db, changed); changed = []

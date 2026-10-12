@@ -18,6 +18,39 @@ def reader_options(config):
     return hashlib.sha256(json.dumps(options | {'readers':3},sort_keys=True).encode()).hexdigest()
 
 
+def fingerprint(path, size):
+    """Huella del contenido: completa hasta 8 MB; en archivos mayores, inicio, centro y final."""
+    digest = hashlib.blake2b(str(size).encode(), digest_size=20)
+    with open(path, 'rb') as handle:
+        if size <= 8 * 1024 * 1024:
+            while block := handle.read(1024 * 1024): digest.update(block)
+        else:
+            for offset in (0, size // 2, size - 1024 * 1024):
+                handle.seek(offset); digest.update(handle.read(1024 * 1024))
+    return digest.hexdigest()
+
+
+def reuse(db, path, stat, kind, options, print_):
+    """Copia el análisis de un archivo idéntico ya completado; devuelve True si lo hizo."""
+    twin = db.execute('''SELECT id,cursor FROM files WHERE fingerprint=? AND size=? AND kind=? AND options=?
+                         AND complete=1 AND error IS NULL AND path<>? LIMIT 1''',
+                      (print_, stat.st_size, kind, options, str(path))).fetchone()
+    if twin is None: return False
+    with db:
+        db.execute('''INSERT INTO files(path,mtime,size,kind,error,options,complete,cursor,fingerprint) VALUES(?,?,?,?,NULL,?,1,?,?)
+           ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime,size=excluded.size,kind=excluded.kind,error=NULL,
+           options=excluded.options,complete=1,cursor=excluded.cursor,fingerprint=excluded.fingerprint''',
+                   (str(path), stat.st_mtime_ns, stat.st_size, kind, options, twin['cursor'], print_))
+        file_id = db.execute('SELECT id FROM files WHERE path=?', (str(path),)).fetchone()[0]
+        db.execute('DELETE FROM segments WHERE file=?', (file_id,))
+        for text, segment_kind, loc, end, vec, sets_scale in db.execute(
+                'SELECT text,kind,loc,end,vec,sets_scale FROM segments WHERE file=? ORDER BY id', (twin['id'],)).fetchall():
+            row = db.execute('INSERT INTO segments(file,text,kind,loc,end,vec,sets_scale) VALUES(?,?,?,?,?,?,?)',
+                             (file_id, text, segment_kind, loc, end, vec, sets_scale))
+            db.execute('INSERT INTO words(rowid,path,text) VALUES(?,?,?)', (row.lastrowid, str(path), text))
+    return True
+
+
 def lock_path(db_path=None):
     """Un cerrojo por índice: las pruebas con su propia base no chocan con el servicio."""
     return Path(db_path).with_suffix('.lock') if db_path else DATA/'index.lock'
@@ -75,6 +108,12 @@ def index(config=None, stop=None, notify=None, db_path=None, engine=None,
                     if same and old['complete']:
                         state['unchanged'] += 1
                         continue
+                    print_ = old['fingerprint'] if same else None
+                    if not same:
+                        print_ = fingerprint(path, stat.st_size)
+                        if reuse(db, path, stat, kind, options, print_):
+                            state['done'] += 1; state['reused'] = state.get('reused', 0) + 1
+                            continue
                     resume = json.loads(old['cursor']) if same else None
                     if stat.st_size > config['max_file_mb']*1024**2:
                         raise ValueError(f"Supera {config['max_file_mb']} MB")
@@ -122,10 +161,10 @@ def index(config=None, stop=None, notify=None, db_path=None, engine=None,
                     if (after.st_mtime_ns,after.st_size)!=(stat.st_mtime_ns,stat.st_size):
                         raise ValueError('El archivo cambió mientras se leía; se reintentará')
                     with db:
-                        db.execute('''INSERT INTO files(path,mtime,size,kind,error,options,complete,cursor) VALUES(?,?,?,?,NULL,?,?,?)
+                        db.execute('''INSERT INTO files(path,mtime,size,kind,error,options,complete,cursor,fingerprint) VALUES(?,?,?,?,NULL,?,?,?,?)
                            ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime,size=excluded.size,kind=excluded.kind,error=NULL,
-                           options=excluded.options,complete=excluded.complete,cursor=excluded.cursor''',
-                           (str(path),stat.st_mtime_ns,stat.st_size,kind,options,int(complete),json.dumps(last_cursor)))
+                           options=excluded.options,complete=excluded.complete,cursor=excluded.cursor,fingerprint=excluded.fingerprint''',
+                           (str(path),stat.st_mtime_ns,stat.st_size,kind,options,int(complete),json.dumps(last_cursor),print_))
                         file_id = db.execute('SELECT id FROM files WHERE path=?',(str(path),)).fetchone()[0]
                         if not same: db.execute('DELETE FROM segments WHERE file=?',(file_id,))
                         for text,segment_kind,loc,end,vec,sets_scale in staging.execute('SELECT * FROM staged'):

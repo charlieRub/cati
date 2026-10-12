@@ -23,7 +23,7 @@ DEFAULTS = {"folders": [user_folder('DOCUMENTS', 'Documents'), user_folder('DOWN
             "max_file_mb": 500, "max_text_mb": 32, "max_pdf_pages": 5000, "video_stride": 8,
             "exclude": [str(PROJECT)], "gpu_layers": 0}
 DEFAULTS.update(scope='computer', skip_datasets=False, project_screenshots_only=False,
-                scan_seconds=300, event_delay=2, job_segments=16, job_seconds=2, engine_idle=900)
+                scan_seconds=1800, event_delay=2, job_segments=16, job_seconds=2, engine_idle=900)
 
 
 def load():

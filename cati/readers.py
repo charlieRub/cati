@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+import queue
 import threading
 import zipfile
 from collections import defaultdict
@@ -184,24 +185,64 @@ def cache_thumbnail(source, original, loc=None):
         bitmap.save(dest,'JPEG',quality=80)
 
 
-_local = threading.local()
+OCR_INSTANCES = 2
+_pool = queue.Queue()
+_created = 0
+_pool_lock = threading.Lock()
+_unavailable = False
+
+
+def _new_ocr():
+    from rapidocr import RapidOCR
+    import logging
+    logging.getLogger('RapidOCR').setLevel(logging.ERROR)
+    params = {'Rec.lang_type': 'es', 'Global.use_cls': False, 'Global.log_level': 'error',
+              'EngineConfig.onnxruntime.intra_op_num_threads': 2, 'EngineConfig.onnxruntime.inter_op_num_threads': 1,
+              'EngineConfig.onnxruntime.enable_cpu_mem_arena': False}
+    try:
+        import onnxruntime
+        if 'CUDAExecutionProvider' in onnxruntime.get_available_providers():
+            params['EngineConfig.onnxruntime.use_cuda'] = True  # NVIDIA: OCR on the GPU
+    except Exception:
+        pass
+    return RapidOCR(params=params)
 
 
 def rapid():
-    """PP-OCRv6 (español y alfabeto latino) por ONNX: lee fotos y capturas mejor que Tesseract y
-    no reconoce nada si no detecta texto. Una instancia por hilo de indexación."""
-    engine = getattr(_local, 'rapid', False)
-    if engine is False:
-        try:
-            from rapidocr import RapidOCR
-            import logging
-            logging.getLogger('RapidOCR').setLevel(logging.ERROR)
-            engine = RapidOCR(params={'Rec.lang_type': 'es', 'Global.use_cls': False, 'Global.log_level': 'error',
-                                      'EngineConfig.onnxruntime.intra_op_num_threads': 4})
-        except Exception:
-            engine = None
-        _local.rapid = engine
-    return engine
+    """Toma una instancia de PP-OCRv6 del grupo (máx. OCR_INSTANCES, 2 hilos cada una, sin reserva
+    de memoria de ONNX). Devuelve None si el OCR moderno no está disponible."""
+    global _created, _unavailable
+    if _unavailable: return None
+    try:
+        return _pool.get_nowait()
+    except queue.Empty:
+        pass
+    with _pool_lock:
+        if _created < OCR_INSTANCES:
+            try:
+                engine = _new_ocr()
+            except Exception:
+                _unavailable = True
+                return None
+            _created += 1
+            return engine
+    return _pool.get()
+
+
+def give_back(engine):
+    _pool.put(engine)
+
+
+def release_ocr():
+    """Libera las instancias inactivas; se recrean al volver a necesitarlas."""
+    global _created
+    with _pool_lock:
+        while True:
+            try: _pool.get_nowait()
+            except queue.Empty: break
+            _created -= 1
+    import gc
+    gc.collect()
 
 
 def tesseract(path):
@@ -221,6 +262,8 @@ def ocr(path):
             return '\n'.join(result.txts or ()).strip()
         except Exception:
             pass
+        finally:
+            give_back(engine)
     return tesseract(path)
 
 

@@ -111,9 +111,9 @@ def install_hyprland(binding='SUPER ALT, U'):
     else:
         rules = '\n'.join(f'windowrulev2 = {rule}, class:^({pattern})$' for rule in ('float', 'center', 'size 1240 780'))
     previous = HYPR_FILE.read_text() if HYPR_FILE.exists() else None
-    HYPR_FILE.write_text(f'''# Cati · ventana flotante centrada, atajo y arranque residente
+    HYPR_FILE.write_text(f'''# Cati: ventana flotante centrada, atajo y arranque residente
 {rules}
-bindd = {mods}, {key}, Cati · buscar archivos, exec, {LAUNCHER} gui
+bindd = {mods}, {key}, Cati: buscar archivos, exec, {LAUNCHER} gui
 exec-once = {LAUNCHER} gui --background
 ''')
     main = HYPR / 'hyprland.conf'

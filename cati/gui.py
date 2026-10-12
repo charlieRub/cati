@@ -1,4 +1,4 @@
-"""Cati · interfaz GTK4: lista a la izquierda y vista previa a la derecha.
+"""Cati: interfaz GTK4 con lista a la izquierda y vista previa a la derecha.
 
 Toma los colores del tema de Omarchy cuando existe; en cualquier otro escritorio
 usa la paleta propia de Cati.
@@ -24,7 +24,7 @@ gi.require_version('Graphene', '1.0')
 gi.require_version('GtkSource', '5')
 from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gtk, GtkSource, Pango
 
-from . import preview
+from . import preview, properties
 from .config import APP_ID, DATA, PROJECT, load, save
 from .query import normalize, stem
 from .search import searcher
@@ -45,6 +45,7 @@ SUGGESTIONS = ['documento html de pirámides', 'fotos de esta semana', 'pdfs en 
                'vídeos de más de 1 GB']
 SEARCH, COG, CAMERA, EXACT = '\U000F0349', '\U000F0493', '\U000F0100', '\U000F0B34'
 OPEN, FOLDER_OPEN, COPY, LEFT, RIGHT = '\U000F03CC', '\U000F0770', '\U000F018F', '\U000F0141', '\U000F0142'
+INFO = '\U000F02FD'
 TEXT_PREVIEW = {'document', 'code'}
 MEDIA_EXTS = {'.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.mp3', '.wav', '.m4a', '.flac', '.ogg', '.opus', '.aac'}
 
@@ -131,11 +132,21 @@ def css(c):
     .actions {{ padding: 12px 22px 16px 22px; }}
     button.action {{ padding: 5px 12px; margin-right: 8px; border: 1px solid {c['color8']}; color: {c['foreground']}; font-size: 12px; }}
     button.action:hover {{ border-color: {c['accent']}; color: {c['accent']}; }}
+    button.action:checked {{ border-color: {c['accent']}; color: {c['accent']}; background: alpha({c['accent']}, .10); }}
     button.action.primary {{ background: {c['accent']}; color: {c['background']}; border-color: {c['accent']}; }}
     button.action .key {{ color: inherit; opacity: .6; margin-left: 8px; font-size: 10px; }}
     .pager {{ color: {c['muted']}; font-size: 12px; }}
     button.switch {{ padding: 2px 10px; color: {c['muted']}; border: 1px solid {c['color8']}; font-size: 11px; margin-left: 6px; }}
     button.switch:checked {{ color: {c['accent']}; border-color: {c['accent']}; }}
+    .prop-section {{ color: {c['accent']}; font-size: 11px; letter-spacing: 1px; margin: 16px 0 6px 2px; }}
+    .props {{ background: transparent; }}
+    expander.prop-group {{ margin: 4px 0; }}
+    expander.prop-group title {{ color: {c['foreground']}; font-size: 12px; padding: 6px 4px; }}
+    expander.prop-group title:hover {{ color: {c['accent']}; }}
+    .props > row {{ padding: 6px 10px; border-bottom: 1px solid alpha({c['color8']}, .5); }}
+    .props > row:hover {{ background: {c['lighter_background']}; }}
+    .prop-key {{ color: {c['muted']}; font-size: 12px; }}
+    .prop-value {{ color: {c['foreground']}; font-size: 12px; }}
     .big-glyph {{ font-size: 96px; color: {c['color8']}; }}
     .empty {{ color: {c['muted']}; font-size: 13px; }}
     .entry-row {{ padding: 3px 10px; }}
@@ -349,13 +360,16 @@ class Cati(Gtk.Application):
             self.searcher = searcher()
             self.searcher.refresh()
             GLib.idle_add(self.search_now if self.entry.get_text().strip() else self.show_recent)
-            self.searcher.warm()
+            # Loading at login would hold the model in memory for nothing: warm it when the window opens.
+            if self.window.get_visible(): self.searcher.warm()
+            else: self.searcher.refresh()
         except Exception as exc:
             GLib.idle_add(self.problem, str(exc))
 
     def show(self):
         self.apply_theme()
         self.window.present()
+        if self.searcher: self.search_pool.submit(self.searcher.warm)
         self.entry.grab_focus()
         self.entry.select_region(0, -1)
         if not self.entry.get_text().strip() and not self.query_image and self.searcher: self.show_recent()
@@ -385,7 +399,7 @@ class Cati(Gtk.Application):
         self.exact = button(EXACT, 'tool', lambda *_: self.search_now(), 'Solo palabras exactas (sin modelo)', toggle=True)
         bar.append(self.exact)
         bar.append(button(CAMERA, 'tool', self.choose_image, 'Buscar imágenes parecidas a una foto (o arrástrala aquí)'))
-        bar.append(button(COG, 'tool', self.settings, 'Carpetas y ajustes  ·  Ctrl+,'))
+        bar.append(button(COG, 'tool', self.settings, 'Carpetas y ajustes (Ctrl+,)'))
         root.append(bar)
 
         self.filters = Gtk.Box(css_classes=['filters'])
@@ -451,6 +465,9 @@ class Cati(Gtk.Application):
             return True
         if key in {Gdk.KEY_Page_Down, Gdk.KEY_Page_Up}:
             self.move(8 if key == Gdk.KEY_Page_Down else -8)
+            return True
+        if key in {Gdk.KEY_Return, Gdk.KEY_KP_Enter} and alt:
+            if getattr(self, 'props_button', None) and self.shown: self.props_button.set_active(not self.props_button.get_active())
             return True
         if key in {Gdk.KEY_Return, Gdk.KEY_KP_Enter}:
             if self.current: self.open_hit(self.current, folder=ctrl)
@@ -609,8 +626,8 @@ class Cati(Gtk.Application):
             self.tags.append(label('\U000F04F9 ' + tag, 'tag'))
         if self.query_image:
             self.tags.append(label(f'\U000F02E9 como {Path(self.query_image).name}', 'tag'))
-        phase = 'significado' if results.semantic else 'nombre y palabras'
-        self.timing.set_text(f'{results.elapsed * 1000:.0f} ms · {phase}')
+        phase = 'con significado' if results.semantic else 'por nombre y palabras'
+        self.timing.set_text(f'{results.elapsed * 1000:.0f} ms {phase}')
         self.apply_category()
         return False
 
@@ -641,7 +658,7 @@ class Cati(Gtk.Application):
         if not hits:
             title = 'SIN RESULTADOS' if not self.searching else 'BUSCANDO…'
         else:
-            title = f"{len(hits)} RESULTADOS" + ('' if self.category == 'all' else f' · {LABEL[self.category].upper()}')
+            title = f"{len(hits)} RESULTADOS" + ('' if self.category == 'all' else f' EN {LABEL[self.category].upper()}')
         self.fill(hits, title, stems)
 
     def fill(self, hits, title, stems):
@@ -684,7 +701,7 @@ class Cati(Gtk.Application):
         if hit['copies']:
             count = len(hit['copies'])
             top.append(label(f"+{count} {'copia' if count == 1 else 'copias'}", 'copies'))
-        top.append(label(' · '.join(hit['reasons']), 'why', ellipsize=Pango.EllipsizeMode.END, max_width_chars=16))
+        top.append(label(', '.join(hit['reasons']), 'why', ellipsize=Pango.EllipsizeMode.END, max_width_chars=16))
         text.append(top)
         meta = [f"<span foreground=\"{self.kind_colors[hit['kind']]}\">{SINGULAR[hit['kind']]}</span>"]
         if hit['kind'] != 'folder' and hit['size']: meta.append(preview.human_size(hit['size']))
@@ -693,10 +710,11 @@ class Cati(Gtk.Application):
             if hit['kind'] == 'pdf': meta.append(f"página {int(hit['loc'])}")
             elif hit['kind'] == 'code': meta.append(f"línea {int(hit['loc'])}")
             elif hit['kind'] in {'audio', 'video'}: meta.append(preview.clock(hit['loc']))
-        line = Gtk.Box(spacing=0)
-        facts = label('', 'meta')
-        facts.set_markup('  ·  '.join(meta) + '  ·  ')
-        line.append(facts)
+        line = Gtk.Box(spacing=14)
+        for part in meta:
+            piece = label('', 'meta')
+            piece.set_markup(part)
+            line.append(piece)
         line.append(label(short_path(Path(hit['path']).parent), 'meta', ellipsize=Pango.EllipsizeMode.START, hexpand=True))
         text.append(line)
         if hit['excerpt']:
@@ -705,11 +723,22 @@ class Cati(Gtk.Application):
             text.append(snippet)
         layout.append(text)
         row.set_child(layout)
+        context = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        context.connect('pressed', lambda *_: self.properties_for(row))
+        row.add_controller(context)
         drag = Gtk.DragSource(actions=Gdk.DragAction.COPY)
         drag.connect('prepare', lambda *_: Gdk.ContentProvider.new_for_value(
             Gdk.FileList.new_from_array([Gio.File.new_for_path(hit['path'])])))
         row.add_controller(drag)
         return row
+
+    def properties_for(self, row):
+        self.user_moved = True
+        self.props_mode = True
+        if self.results.get_selected_row() is row and self.shown is row.hit:
+            self.props_button.set_active(True)
+        else:
+            self.results.select_row(row)
 
     def visual(self, hit, size):
         """Miniatura real si existe; si no, el glifo del tipo con su color."""
@@ -798,8 +827,13 @@ class Cati(Gtk.Application):
                 f"En {preview.clock(hit['loc'])}: " if hit['kind'] in {'audio', 'video'} and hit['loc'] is not None else '')
             quote.set_markup(f'<b>{GLib.markup_escape_text(where_text)}</b>' + excerpt_markup(hit['excerpt'][:500], stems, self.colors['yellow']))
             self.preview_box.append(quote)
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True, css_classes=['canvas'])
-        self.preview_box.append(body)
+        self.canvas = Gtk.Stack(vexpand=True, css_classes=['canvas'], transition_type=Gtk.StackTransitionType.CROSSFADE,
+                                transition_duration=120)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
+        self.canvas.add_named(body, 'preview')
+        self.props_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
+        self.canvas.add_named(self.props_page, 'props')
+        self.preview_box.append(self.canvas)
         actions = Gtk.Box(css_classes=['actions'])
         primary = Gtk.Box()
         primary.append(label(f'{OPEN}  Abrir'))
@@ -813,6 +847,11 @@ class Cati(Gtk.Application):
         third.append(label(f'{COPY}  Copiar ruta'))
         third.append(label('Ctrl C', 'key'))
         actions.append(button(third, 'action', lambda *_: self.copy_path(hit)))
+        info = Gtk.Box()
+        info.append(label(f'{INFO}  Propiedades'))
+        info.append(label('Alt ⏎', 'key'))
+        self.props_button = button(info, 'action', self.toggle_properties, toggle=True)
+        actions.append(self.props_button)
         self.toolbar = Gtk.Box(hexpand=True, halign=Gtk.Align.END)
         actions.append(self.toolbar)
         self.preview_box.append(actions)
@@ -871,6 +910,134 @@ class Cati(Gtk.Application):
         self.shown = hit
         self.shown_terms = tuple(self.results_intent.terms) if self.results_intent else ()
         body = self.frame(hit)
+        self.pending_preview = lambda: self.build_preview(body, hit)
+        self.props_loaded = False
+        if getattr(self, 'props_mode', False):
+            self.props_button.set_active(True)  # shows the properties; the preview loads only if asked for
+        else:
+            self.run_preview()
+
+    def run_preview(self):
+        build, self.pending_preview = getattr(self, 'pending_preview', None), None
+        if build: build()
+
+    def toggle_properties(self, toggle):
+        self.props_mode = toggle.get_active()
+        self.canvas.set_visible_child_name('props' if self.props_mode else 'preview')
+        self.toolbar.set_visible(not self.props_mode)
+        if self.props_mode:
+            if not self.props_loaded: self.load_properties(self.shown)
+        else:
+            self.run_preview()
+
+    def load_properties(self, hit):
+        self.props_loaded = True
+        self.clear(self.props_page)
+        wait = self.placeholder(self.props_page, 'Leyendo propiedades…')
+        searcher_ = self.searcher
+
+        def work():
+            sections = properties.collect(hit['path'], hit['kind'])
+            sections.append(('En Cati', self.index_rows(hit, searcher_)))
+            return sections, properties.everything(hit['path'])
+
+        def apply(value):
+            self.props_page.remove(wait)
+            if isinstance(value, Exception):
+                self.props_page.append(label(f'No se pudieron leer: {value}', 'empty', xalign=.5, vexpand=True)); return
+            value, extra = value
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            content.set_margin_start(16); content.set_margin_end(16); content.set_margin_bottom(16)
+            for title, rows in value:
+                if not rows: continue
+                content.append(label(title.upper(), 'prop-section'))
+                listing = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=['props'])
+                listing.set_activate_on_single_click(True)
+                listing.connect('row-activated', self.copy_property)
+                for key, value_text in rows:
+                    listing.append(self.property_row(key, str(value_text)))
+                if title == 'General' and hit['kind'] != 'folder':
+                    listing.append(self.hash_row(hit['path']))
+                content.append(listing)
+            if extra is None:
+                content.append(label('TODOS LOS METADATOS', 'prop-section'))
+                content.append(label('Instala ExifTool para ver todos los metadatos (EXIF, XMP, IPTC, GPS, ID3…). '
+                                     'Ejecuta «cati doctor» para ver el paquete de tu sistema.', 'prop-key', wrap=True))
+            elif extra:
+                total = sum(len(rows) for _, rows in extra)
+                content.append(label(f'TODOS LOS METADATOS ({total})', 'prop-section'))
+                for group, rows in extra:
+                    expander = Gtk.Expander(label=f'{group}  ({len(rows)})', css_classes=['prop-group'])
+                    listing = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=['props'])
+                    listing.set_activate_on_single_click(True)
+                    listing.connect('row-activated', self.copy_property)
+                    for key, value_text in rows: listing.append(self.property_row(key, value_text))
+                    expander.set_child(listing)
+                    content.append(expander)
+            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            scroll.set_child(content)
+            self.props_page.append(scroll)
+        self.background_job(work, apply)
+
+    def property_row(self, key, value):
+        line = Gtk.Box(spacing=16)
+        line.append(label(key, 'prop-key', width_chars=18, max_width_chars=18, ellipsize=Pango.EllipsizeMode.END, valign=Gtk.Align.START))
+        line.append(label(value, 'prop-value', hexpand=True, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR))
+        row = Gtk.ListBoxRow(child=line, activatable=True)
+        row.key, row.value = key, value
+        row.set_tooltip_text('Clic para copiar')
+        row.set_cursor(Gdk.Cursor.new_from_name('pointer'))
+        return row
+
+    def hash_row(self, path):
+        row = self.property_row('SHA-256', 'Clic para calcular')
+        row.value = None
+
+        def compute():
+            row.get_child().get_last_child().set_text('Calculando…')
+            def done(value):
+                if isinstance(value, Exception): row.get_child().get_last_child().set_text(f'No disponible: {value}'); return
+                row.value = value
+                row.get_child().get_last_child().set_text(value)
+            self.background_job(lambda: properties.sha256(path), done)
+        row.compute = compute
+        return row
+
+    def copy_property(self, listing, row):
+        if getattr(row, 'value', None) is None:
+            if hasattr(row, 'compute'): row.compute()
+            return
+        self.window.get_clipboard().set_content(Gdk.ContentProvider.new_for_bytes(
+            'text/plain;charset=utf-8', GLib.Bytes.new(row.value.encode())))
+        self.timing.set_text(f'{row.key} copiado')
+
+    @staticmethod
+    def index_rows(hit, searcher_):
+        rows = []
+        stats = searcher_.file_stats(hit['path']) if searcher_ else None
+        if hit['kind'] == 'folder':
+            rows.append(('Búsqueda', 'Por nombre y por el contenido de los archivos que guarda'))
+        elif stats:
+            pieces = {'document': 'texto', 'pdf': 'páginas', 'ocr': 'texto en la imagen', 'image': 'imagen',
+                      'pdf-image': 'páginas escaneadas', 'video-frame': 'fotogramas', 'audio': 'audio', 'code': 'código', 'name': 'nombre'}
+            kinds = [pieces.get(k, k) for k in stats['kinds']]
+            state = 'completo' if stats['complete'] else 'en curso'
+            rows.append(('Análisis', f"{state}, {stats['segments']} fragmentos ({', '.join(dict.fromkeys(kinds))})"))
+            rows.append(('Analizado', properties.when(stats['indexed'] / 1e9) if stats['indexed'] else None))
+        else:
+            rows.append(('Análisis', 'Pendiente: de momento se encuentra por su nombre'))
+        reasons = hit.get('reasons') or []
+        if reasons and reasons != ['reciente']:
+            rows.append(('Por qué aparece', reasons[0] if len(reasons) == 1 else ', '.join(reasons[:-1]) + ' y ' + reasons[-1]))
+        if hit.get('loc') is not None:
+            if hit['kind'] == 'pdf': rows.append(('Coincidencia', f"página {int(hit['loc'])}"))
+            elif hit['kind'] in {'audio', 'video'}: rows.append(('Coincidencia', f"en {preview.clock(hit['loc'])}"))
+            elif hit['kind'] == 'code': rows.append(('Coincidencia', f"línea {int(hit['loc'])}"))
+        for index, path in enumerate(hit.get('copies') or []):
+            rows.append(('Copia' if len(hit['copies']) == 1 else f'Copia {index + 1}', path))
+        return [r for r in rows if r[1]]
+
+    def build_preview(self, body, hit):
         kind = hit['kind']
         ext = Path(hit['path']).suffix.lower()
         try:
@@ -916,8 +1083,8 @@ class Cati(Gtk.Application):
     def preview_pdf(self, body, hit):
         state = {'page': int(hit['loc'] or 1), 'pages': None}
         counter = label('', 'pager')
-        previous = button(LEFT, 'switch', lambda *_: turn(-1), 'Página anterior  ·  Alt ←')
-        following = button(RIGHT, 'switch', lambda *_: turn(1), 'Página siguiente  ·  Alt →')
+        previous = button(LEFT, 'switch', lambda *_: turn(-1), 'Página anterior (Alt ←)')
+        following = button(RIGHT, 'switch', lambda *_: turn(1), 'Página siguiente (Alt →)')
         for widget in (previous, counter, following): self.toolbar.append(widget)
         counter.set_margin_start(8); counter.set_margin_end(2)
         holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
@@ -1050,7 +1217,8 @@ class Cati(Gtk.Application):
             body.remove(wait)
             if isinstance(value, Exception):
                 body.append(label(f'No se puede leer la carpeta: {value}', 'empty', xalign=.5, vexpand=True)); return
-            self.add_fact(f"{value['folders']} carpetas · {value['files']} archivos")
+            folders, files = value['folders'], value['files']
+            self.add_fact(f"{folders} {'carpeta' if folders == 1 else 'carpetas'} y {files} {'archivo' if files == 1 else 'archivos'}")
             if value['bytes']: self.add_fact(preview.human_size(value['bytes']))
             content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             if value['images']:
@@ -1099,7 +1267,7 @@ class Cati(Gtk.Application):
             if isinstance(value, Exception) or value is None:
                 self.preview_other(body, hit); return
             self.add_fact(f"{value['count']} elementos")
-            text = '\n'.join(f"{name}{'' if size is None else '  ·  ' + preview.human_size(size)}" for name, size in value['entries'])
+            text = '\n'.join(f"{name}{'' if size is None else '    ' + preview.human_size(size)}" for name, size in value['entries'])
             buffer = GtkSource.Buffer(text=text)
             buffer.set_style_scheme(self.scheme)
             view = GtkSource.View(buffer=buffer, editable=False, monospace=True, left_margin=14, top_margin=12)
@@ -1159,7 +1327,7 @@ class Cati(Gtk.Application):
         self.query_image = path
         if path:
             self.entry.set_text('')
-            self.entry.set_placeholder_text(f'Imágenes parecidas a {Path(path).name}  ·  Esc para quitar')
+            self.entry.set_placeholder_text(f'Imágenes parecidas a {Path(path).name} (Esc para quitar)')
             self.search_now()
         else:
             self.entry.set_placeholder_text('Describe lo que buscas: «documento html de pirámides», «fotos de ayer»…')
@@ -1206,17 +1374,17 @@ class Cati(Gtk.Application):
             self.dot.add_css_class('busy'); parts.append('revisando carpetas…')
         elif state.get('queued'):
             self.dot.add_css_class('busy')
-            parts.append(f"analizando · {fmt(state['queued'])} en cola")
+            parts.append(f"{fmt(state['queued'])} en cola de análisis")
         else:
-            parts.append('todo al día · vigilando cambios')
+            parts.append('todo al día, vigilando cambios')
         if state.get('error'): parts.append(state['error'])
-        self.status.set_text('  ·  '.join(parts))
+        self.status.set_text(', '.join(parts))
         return False
 
     # ------------------------------------------------------------- ajustes
     def settings(self, *_):
         config = load()
-        dialog = Gtk.Window(title='Cati · Ajustes', transient_for=self.window, modal=True, decorated=False)
+        dialog = Gtk.Window(title='Ajustes de Cati', transient_for=self.window, modal=True, decorated=False)
         dialog.add_css_class('cati-dialog')
         dialog.set_default_size(620, 480)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, css_classes=['panel'])

@@ -31,6 +31,8 @@ REQUIREMENTS = {
     'vulkan': ('Aceleración por GPU con Vulkan', False, {
         'arch': 'vulkan-headers vulkan-icd-loader shaderc', 'debian': 'libvulkan-dev glslc', 'fedora': 'vulkan-headers vulkan-loader-devel glslc',
         'suse': 'vulkan-devel shaderc'}),
+    'metadata': ('ExifTool para ver todos los metadatos (EXIF, XMP, IPTC, GPS, ID3…)', False, {
+        'arch': 'perl-image-exiftool', 'debian': 'libimage-exiftool-perl', 'fedora': 'perl-Image-ExifTool', 'suse': 'exiftool'}),
     'browser': ('Chromium para la vista previa de páginas HTML', False, {
         'arch': 'chromium', 'debian': 'chromium', 'fedora': 'chromium', 'suse': 'chromium'}),
 }
@@ -86,6 +88,7 @@ def check():
         'python': python_ok(),
         'tools': bool(have('xdg-open') and have('file')),
         'vulkan': vulkan_ok(),
+        'metadata': bool(have('exiftool')),
         'browser': bool(have('chromium') or have('chromium-browser') or have('google-chrome-stable')),
     }
 
@@ -101,10 +104,10 @@ def report(optional=True):
     """Imprime el diagnóstico; devuelve la lista de requisitos obligatorios que faltan."""
     status = check()
     print(f'Sistema: {platform.freedesktop_os_release().get("PRETTY_NAME", "Linux") if hasattr(platform, "freedesktop_os_release") else "Linux"}'
-          f' · Python {platform.python_version()}')
+          f', Python {platform.python_version()}')
     for name, (description, required, _) in REQUIREMENTS.items():
         if not required and not optional: continue
-        mark = '✓' if status[name] else ('✗' if required else '·')
+        mark = '✓' if status[name] else ('✗' if required else '-')
         print(f'  {mark} {description}' + ('' if status[name] or required else '  (opcional)'))
     missing = [n for n, ok in status.items() if not ok and REQUIREMENTS[n][1]]
     extras = [n for n, ok in status.items() if not ok and not REQUIREMENTS[n][1]]
