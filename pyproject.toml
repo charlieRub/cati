@@ -1,0 +1,31 @@
+[project]
+name = "cati"
+version = "1.0.0"
+description = "Encuentra cualquier archivo de tu Linux describiéndolo con tus palabras"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+dependencies = [
+  "numpy>=2,<3",
+  "Pillow>=11,<14",
+  "inotify-simple>=2,<3",
+  "rapidocr>=3.10,<4",
+  "onnxruntime>=1.20,<2",
+]
+classifiers = [
+  "Environment :: X11 Applications :: GTK",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Desktop Environment :: File Managers",
+  "Topic :: Text Processing :: Indexing",
+]
+
+[project.scripts]
+cati = "cati.__main__:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cati*"]
