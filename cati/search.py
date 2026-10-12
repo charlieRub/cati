@@ -3,6 +3,7 @@
 Los vectores viven en memoria (float16) y se actualizan por incrementos cuando el
 indexador publica cambios, así que una consulta solo cuesta un producto matricial.
 """
+import fcntl
 import math
 from difflib import SequenceMatcher
 import re
@@ -19,9 +20,10 @@ from .catalog import ARCHIVES, EXTRA_CODE, EXTRA_IMAGES, OFFICE, SHEETS, SLIDES,
 from .engine import Engine
 from .query import Intent, normalize, parse, stem
 from .readers import AUDIO, CODE, IMAGES, TEXT, VIDEO, image
+from .config import DATA
 from .store import connect
 
-HEAD, CANDIDATES, SAMPLE = 256, 3000, 4000
+CANDIDATES, SAMPLE = 10000, 4000
 MODALITY = {'audio': 2, 'image': 1, 'pdf-image': 1, 'video-frame': 1, 'doc-image': 1}
 CATEGORY_EXTS = {'document': TEXT | OFFICE, 'pdf': {'.pdf'}, 'image': IMAGES | EXTRA_IMAGES, 'video': VIDEO,
                  'audio': AUDIO, 'sheet': SHEETS, 'slides': SLIDES, 'code': CODE | EXTRA_CODE, 'archive': ARCHIVES}
@@ -61,11 +63,11 @@ class Searcher:
         self.vectors = OrderedDict()
 
     # ------------------------------------------------------------------ caché
-    # Vectors: the first 256 dimensions (float32, normalised) rank everything in a few
-    # milliseconds; the full 768 are rebuilt only for the best candidates.
+    # Vectors: a 1-bit sign code per dimension (96 bytes) stays in memory and ranks the whole
+    # index by Hamming distance; full 768-dimension float16 vectors live in a file on disk and
+    # are read only for the best candidates (the kernel caches what is used).
     LAYOUT = {'ids': (np.int64, ()), 'seg_file': (np.int64, ()), 'seg_mod': (np.int8, ()), 'seg_scale': (bool, ()),
-              'alive': (bool, ()), 'head': (np.float32, (HEAD,)), 'head_norm': (np.float32, ()),
-              'tail': (np.float16, (768 - HEAD,))}
+              'alive': (bool, ()), 'bits': (np.uint8, (96,))}
 
     def allocate(self, capacity):
         grown = {}
@@ -78,14 +80,43 @@ class Searcher:
 
     def views(self):
         for name in self.LAYOUT: setattr(self, name, self.columns[name][:self.size])
+        self.full = None  # reopened lazily at the right length
+
+    def owner(self):
+        """Un solo proceso mantiene la caché compartida; los demás (p. ej. «cati search») usan una privada."""
+        if not hasattr(self, '_owner'):
+            base = Path(self.db_path).with_suffix('.vectors.lock') if self.db_path else DATA / 'vectors.lock'
+            self._lock = open(base, 'a')
+            try:
+                fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._owner = True
+            except BlockingIOError:
+                self._owner = False
+                self._private = tempfile.NamedTemporaryFile(prefix='cati-vectors-', dir=base.parent, delete=True)
+        return self._owner
+
+    def vectors_path(self):
+        if not self.owner(): return Path(self._private.name)
+        return Path(self.db_path).with_suffix('.vectors.f16') if self.db_path else DATA / 'vectors.f16'
+
+    def snapshot_path(self):
+        return Path(self.db_path).with_suffix('.vectors.npz') if self.db_path else DATA / 'vectors.npz'
+
+    def matrix(self):
+        if self.full is None and self.size:
+            self.full = np.memmap(self.vectors_path(), dtype=np.float16, mode='r', shape=(self.size, 768))
+        return self.full
 
     def append(self, rows):
         count = len(rows)
         if self.size + count > len(self.columns['ids']):
             self.allocate(max(4096, 2 * len(self.columns['ids']), self.size + count))  # amortised: no copy per refresh
         block = np.frombuffer(b''.join(r[4] for r in rows), dtype='<f4').reshape(count, 768)
-        head = block[:, :HEAD]
-        norm = np.linalg.norm(head, axis=1)
+        path = self.vectors_path()
+        if self.size == 0: open(path, 'wb').close()  # a fresh cache starts empty
+        with open(path, 'ab') as out:
+            out.write(block.astype(np.float16).tobytes())
+        path.chmod(0o600)
         end = self.size + count
         c = self.columns
         c['ids'][self.size:end] = [r[0] for r in rows]
@@ -93,19 +124,61 @@ class Searcher:
         c['seg_mod'][self.size:end] = [MODALITY.get(r[2], 0) for r in rows]
         c['seg_scale'][self.size:end] = [bool(r[3]) for r in rows]
         c['alive'][self.size:end] = True
-        c['head'][self.size:end] = head / np.maximum(norm, 1e-8)[:, None]
-        c['head_norm'][self.size:end] = norm
-        c['tail'][self.size:end] = block[:, HEAD:]
+        c['bits'][self.size:end] = np.packbits(block > 0, axis=1)
         self.size = end
         self.views()
 
     def exact(self, rows, vector):
-        """Coseno completo de 768 dimensiones para las filas pedidas."""
-        return (self.head[rows] @ vector[:HEAD]) * self.head_norm[rows] + self.tail[rows].astype(np.float32) @ vector[HEAD:]
+        """Coseno completo (768 dimensiones) leyendo del disco solo las filas pedidas, en orden."""
+        return self.matrix()[rows].astype(np.float32) @ vector
+
+    def load_snapshot(self):
+        """Arranque sin releer SQLite: metadatos y huellas desde la copia, vectores desde su archivo."""
+        if not self.owner(): return
+        try:
+            with np.load(self.snapshot_path()) as data:
+                size = len(data['ids'])
+                if int(data['dims']) != 768 or self.vectors_path().stat().st_size != size * 768 * 2: raise ValueError
+                self.allocate(max(4096, size))
+                for name in self.LAYOUT: self.columns[name][:size] = data[name]
+                self.size = size
+                self.last_id = int(data['ids'][-1]) if size else 0
+                self.views()
+            newest = self.db.execute('SELECT max(id) FROM segments').fetchone()[0] or 0
+            if self.last_id > newest: raise ValueError  # index rebuilt since the copy was saved
+        except (OSError, KeyError, ValueError):
+            self.size, self.last_id = 0, 0
+            self.allocate(0)
+
+    def save_snapshot(self):
+        if not self.owner(): return
+        path = self.snapshot_path()
+        partial = path.with_name(path.name + '.part.npz')
+        try:
+            np.savez(partial, dims=768, **{name: getattr(self, name) for name in self.LAYOUT})
+            partial.chmod(0o600)
+            partial.replace(path)
+            self.saved = self.size
+        except OSError:
+            partial.unlink(missing_ok=True)
+
+    def compact(self):
+        """Reescribe sin los fragmentos borrados cuando ya son más de una cuarta parte."""
+        keep = np.nonzero(self.alive)[0]
+        vectors = np.array(self.matrix()[keep])
+        for name in self.LAYOUT: self.columns[name][:len(keep)] = self.columns[name][keep]
+        self.size = len(keep)
+        temporary = self.vectors_path().with_suffix('.tmp')
+        vectors.tofile(temporary)
+        temporary.chmod(0o600)
+        temporary.replace(self.vectors_path())
+        self.views()
+        self.save_snapshot()
 
     def refresh(self):
         version = self.db.execute('PRAGMA data_version').fetchone()[0]
         if version == self.version: return
+        if self.version is None: self.load_snapshot()
         self.version = version
         rows = self.db.execute('SELECT id,file,kind,sets_scale,vec FROM segments WHERE id>? ORDER BY id', (self.last_id,)).fetchall()
         if rows:
@@ -116,11 +189,10 @@ class Searcher:
             live = np.fromiter((r[0] for r in self.db.execute('SELECT id FROM segments')), np.int64)
             self.columns['alive'][:self.size] = np.isin(self.ids, live)
             self.views()
-            if self.alive.sum() < .75 * self.size:
-                keep = np.nonzero(self.alive)[0]
-                for name in self.LAYOUT: self.columns[name][:len(keep)] = self.columns[name][keep]
-                self.size = len(keep)
-                self.views()
+            if self.alive.sum() < .75 * self.size: self.compact()
+        # Keep the copy on disk close to the index: rewrite after every few thousand new fragments.
+        if self.size - getattr(self, 'saved', 0) >= 4000 or (rows and getattr(self, 'saved', None) is None):
+            self.save_snapshot()
         self.files = {r[0]: (r[1], r[2], r[3], r[4], kind_of(r[1], r[2])) for r in
                       self.db.execute('SELECT id,path,kind,mtime,size FROM files WHERE error IS NULL')}
         self.by_path = {info[0]: fid for fid, info in self.files.items()}
@@ -284,16 +356,16 @@ class Searcher:
     def by_meaning(self, vector, code, allowed_file, image_query, keep=()):
         """Mejor fragmento por archivo, con puntuación z calibrada por modalidad.
 
-        Pasada gruesa (256 dimensiones) sobre todo el índice y coseno exacto solo para los
-        candidatos, una muestra fija para la calibración y los archivos de `keep`."""
+        Pasada gruesa por distancia Hamming sobre las huellas binarias de todo el índice y coseno
+        exacto solo para los candidatos, una muestra fija para la calibración y los archivos de `keep`."""
         if not self.size: return {}, {}
         base = self.alive & (self.file_code[np.minimum(self.seg_file, len(self.file_code) - 1)] == code)
         indices = np.nonzero(base)[0]
         if not len(indices): return {}, {}
         vector = vector.astype(np.float32)
-        head = vector[:HEAD] / max(float(np.linalg.norm(vector[:HEAD])), 1e-8)
-        coarse = self.head[indices] @ head
-        top = indices[np.argpartition(-coarse, min(CANDIDATES, len(indices) - 1))[:CANDIDATES]] if len(indices) > CANDIDATES else indices
+        distance = np.bitwise_count(self.bits[indices] ^ np.packbits(vector > 0)).sum(axis=1, dtype=np.uint16)
+        wanted = min(CANDIDATES, max(3000, len(indices) // 15))  # ~7 % of the index: recall ≥ 0.98 at any size
+        top = indices[np.argpartition(distance, wanted)[:wanted]] if len(indices) > wanted else indices
         sample = indices[::max(1, len(indices) // SAMPLE)]
         mods = self.seg_mod[indices]
         small = [m for m in (0, 1, 2) if 0 < int((mods == m).sum()) < 20]

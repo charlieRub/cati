@@ -143,7 +143,7 @@ cati voice --file nota.wav    # transcribe e interpreta un audio
 - **OCR**: [PP-OCRv6](https://github.com/PaddlePaddle/PaddleOCR) por ONNX (RapidOCR) lee el texto de fotos, capturas y PDF escaneados, y solo reconoce zonas donde detecta texto. Tesseract queda de respaldo.
 - **Contenido**: el texto se trocea y se indexa por palabras (FTS5) y por significado. Las imágenes, fotogramas de vídeo y fragmentos de audio se codifican con el mismo modelo multimodal, así que una frase en español encuentra una foto.
 - **Motor**: [llama.cpp](https://github.com/ggml-org/llama.cpp) con EmbeddingGemma 2, escuchando solo en `127.0.0.1` y con clave. Tiene dos ranuras, para que una búsqueda no espere detrás del análisis.
-- **Búsqueda**: los vectores viven en memoria y se actualizan por incrementos. Una pasada con las primeras 256 dimensiones ordena todo el índice en milisegundos y la precisión completa (768) se calcula solo para los mejores candidatos; mientras escribes, el análisis de fondo cede la GPU.
+- **Búsqueda**: en memoria solo hay una huella binaria de cada fragmento (96 bytes; unos 14 MB para 150.000). La distancia Hamming ordena todo el índice en milisegundos y los vectores completos, guardados en disco, se leen solo para el 7 % de mejores candidatos (recall ≥ 98 % frente a la búsqueda exacta). Al arrancar se carga una copia en disco, de modo que lo ya analizado nunca se recalcula ni se relee. Mientras escribes, el análisis de fondo cede la GPU.
 - **Voz**: graba hasta detectar silencio, recorta el contexto de audio de Whisper a la duración real de la frase (unas cinco veces menos trabajo) y mantiene el modelo cargado solo mientras usas la voz.
 
 ## Privacidad
