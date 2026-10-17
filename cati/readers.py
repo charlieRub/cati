@@ -1,4 +1,5 @@
 """Lectores Linux: Poppler, Tesseract, Pillow y FFmpeg; nunca modifican el original."""
+import functools
 import html
 import hashlib
 import math
@@ -9,6 +10,7 @@ import subprocess
 import tempfile
 import queue
 import threading
+import wave
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -26,7 +28,10 @@ IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 AUDIO = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
 VIDEO = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
 CODE = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".c", ".h", ".cpp", ".java", ".swift", ".sh", ".lua", ".vue", ".svelte", ".kt", ".rb", ".php", ".sql"}
-SKIP_DIRS = {"node_modules", "venv", "__pycache__", "vendor", "Vendor", "third_party", "build", "dist", "target", "site-packages", "cache", "caches"}
+SKIP_DIRS = {"node_modules", "venv", "__pycache__", "vendor", "Vendor", "third_party", "build", "build-vulkan", "build-cpu", "build-release", "build-debug", "dist", "target", "site-packages", "cache", "caches"}
+# Installed toolchains (Android SDK, a Go root): thousands of internal icons and pages nobody searches for.
+# Recognised by what they contain, wherever they are installed.
+TOOLCHAIN_MARKERS = ({".knownPackages"}, {"platform-tools", "build-tools"}, {"VERSION", "api", "bin", "pkg", "src"})
 PROJECT_MARKERS = {".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "Package.swift", "CMakeLists.txt", "requirements.txt"}
 SECRET_EXT = {".pem", ".key", ".p12", ".pfx", ".kdbx", ".gpg", ".asc", ".crt", ".cer", ".der", ".ppk"}
 SECRET_NAMES = ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".env", "secret", "credential", "password", "passwd", "contraseñ", "htpasswd")
@@ -46,6 +51,58 @@ def allowed(path):
     name = path.name.lower()
     return not (name.startswith(".") or name.startswith(SECRET_NAMES) or path.suffix.lower() in SECRET_EXT
                 or re.search(r"(?:^|[-_. ])(?:passwords?|credentials?|secrets?|contraseñas?)(?:[-_. ]|$)", name))
+
+
+def toolchain(names):
+    """¿Es esta carpeta, por su contenido, una instalación de herramientas?"""
+    return any(marker <= names for marker in TOOLCHAIN_MARKERS)
+
+
+def mirror(folder, sample=300):
+    """¿Es una copia generada del proyecto que la contiene? Una herramienta deja una ficha «ruta/X.md» por
+    cada fuente «ruta/X.ts» del proyecto: duplica el código y gana a la fuente al buscar su nombre."""
+    try:
+        with os.scandir(folder) as entries:
+            listed = [(e.name, e.is_dir(follow_symlinks=False)) for e in entries if not e.name.startswith('.')]
+        project = os.path.dirname(folder)
+        beside = set(os.listdir(project))
+    except OSError: return False
+    folders = [n for n, d in listed if d]
+    files = [n for n, d in listed if not d]
+    # Cheap filter first: every subfolder repeats one of the project's, and almost every file is a note.
+    if not folders and len(files) < 5: return False
+    if any(n not in beside for n in folders) or sum(not n.endswith('.md') for n in files) > len(files) // 10: return False
+    sources, notes, echoed = {}, 0, 0
+    for here, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        original = os.path.normpath(os.path.join(project, os.path.relpath(here, folder)))
+        if original not in sources:
+            try: sources[original] = {os.path.splitext(n)[0] for n in os.listdir(original) if not n.endswith('.md')}
+            except OSError: sources[original] = set()
+        for name in names:
+            if not name.endswith('.md'): continue
+            notes += 1
+            echoed += name[:-3] in sources[original]
+        if notes >= sample: break
+    return notes >= 5 and echoed >= .7 * notes
+
+
+def toolchain_dir(folder):
+    """Carpetas que no se recorren por lo que contienen: instalaciones de herramientas y copias generadas."""
+    try: return toolchain(set(os.listdir(folder))) or mirror(folder)
+    except OSError: return False
+
+
+# Events arrive file by file: remember the answer for their folders.
+known_toolchain = functools.lru_cache(maxsize=8192)(toolchain_dir)
+
+
+def inside_toolchain(path, root):
+    """¿Es `path`, o alguna carpeta entre él y `root`, una instalación de herramientas?"""
+    for folder in (path, *path.parents):
+        if folder == root or root not in folder.parents: return False
+        if known_toolchain(str(folder)): return True
+    return False
 
 
 def file_kind(path, code=False):
@@ -77,8 +134,11 @@ def walk(config, on_directory=None, stop=None):
             if any(base == p or p in base.parents for p in excluded):
                 dirs[:] = []
                 continue
-            if on_directory: on_directory(base)
             names = set(dirs) | set(files)
+            if base != root and (toolchain(names) or mirror(str(base))):
+                dirs[:] = []
+                continue
+            if on_directory: on_directory(base)
             in_project = bool(names & PROJECT_MARKERS) or projects.get(base.parent, False)
             projects[base] = in_project
             repo = next((p for p in [base, *base.parents] if p in git_files), None)
@@ -152,23 +212,44 @@ def numbered(names, prefix):
                   key=lambda n: int(re.search(r"(\d+)\.xml$", n)[1]) if re.search(r"(\d+)\.xml$", n) else 0)
 
 
-def spreadsheet(archive):
-    """Celdas de XLSX por filas: «Hoja 1: concepto | importe».""" 
+XLSX_ROW = re.compile(rb'<(?:\w+:)?row\b[^>]*?(?:/>|>(.*?)</(?:\w+:)?row>)', re.S)
+XLSX_CELL = re.compile(rb'<(?:\w+:)?c\b([^>]*)(?<!/)>(.*?)</(?:\w+:)?c>', re.S)   # solo celdas con contenido
+XLSX_VALUE = re.compile(rb'<(?:\w+:)?[vt]\b[^>]*?(?:/>|>(.*?)</(?:\w+:)?[vt]>)', re.S)
+XLSX_TYPE = re.compile(rb'\st="([^"]*)"')
+
+
+def xml_unescape(raw):
+    text = raw.decode("utf-8", "replace")
+    if "&" in text: text = html.unescape(text)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def spreadsheet(archive, limit=None):
+    """Celdas de XLSX por filas: «Hoja 1: concepto | importe». Con `limit` se detiene al llegar a esos caracteres.
+
+    Las hojas se recorren con expresiones regulares: una hoja exportada suele tener millones de celdas vacías
+    y el árbol XML tardaría segundos en visitarlas.
+    """
     shared = []
     if "xl/sharedStrings.xml" in archive.namelist():
         tree = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
         shared = ["".join(t.text or "" for t in si.iter() if t.tag.endswith("}t")) for si in tree if si.tag.endswith("}si")]
-    lines = []
+    lines, size = [], 0
     for number, name in enumerate(numbered(archive.namelist(), "xl/worksheets/sheet"), 1):
         lines.append(f"Hoja {number}:")
-        for row in ElementTree.fromstring(archive.read(name)).iter():
-            if not row.tag.endswith("}row"): continue
+        for row in XLSX_ROW.finditer(archive.read(name)):
+            if not row[1]: continue
             cells = []
-            for cell in row:
-                value = next((v.text for v in cell.iter() if v.tag.endswith("}v") or v.tag.endswith("}t")), None)
-                if value is None: continue
-                cells.append(shared[int(value)] if cell.get("t") == "s" and value.isdigit() and int(value) < len(shared) else value)
-            if cells: lines.append(" | ".join(cells))
+            for cell in XLSX_CELL.finditer(row[1]):
+                found = XLSX_VALUE.search(cell[2]) if cell[2] else None
+                if not found or not found[1]: continue
+                value = xml_unescape(found[1])
+                kind = XLSX_TYPE.search(cell[1])
+                cells.append(shared[int(value)] if kind and kind[1] == b"s" and value.isdigit() and int(value) < len(shared) else value)
+            if cells:
+                lines.append(" | ".join(cells))
+                size += len(lines[-1]) + 1
+                if limit and size > limit: return "\n".join(lines)
     return "\n".join(lines)
 
 
@@ -182,7 +263,8 @@ def rtf(raw):
     return raw.replace("\\\\", "\\")
 
 
-def document(path):
+def document(path, limit=None):
+    """Texto del documento; `limit` permite parar antes en las hojas de cálculo grandes (vista previa)."""
     ext = path.suffix.lower()
     if ext in {".docx", ".odt", ".ods", ".odp", ".pptx", ".xlsx", ".epub"}:
         with zipfile.ZipFile(path) as archive:
@@ -191,7 +273,7 @@ def document(path):
             names = archive.namelist()
             if ext == ".docx": return xml_text(archive.read("word/document.xml"))
             if ext in {".odt", ".ods", ".odp"}: return xml_text(archive.read("content.xml"))
-            if ext == ".xlsx": return spreadsheet(archive)
+            if ext == ".xlsx": return spreadsheet(archive, limit)
             if ext == ".pptx":
                 return "\n\n".join(f"Diapositiva {n}:\n" + xml_text(archive.read(name)) for n, name in enumerate(numbered(names, "ppt/slides/slide"), 1))
             # EPUB: chapters in reading order when the OPF spine is readable, else by name.
@@ -231,13 +313,14 @@ def embedded_images(path, work, limit=24, minimum=256):
         for info in sorted(archive.infolist(), key=lambda i: -i.file_size):
             name = info.filename
             if not name.startswith(prefix) or Path(name).suffix.lower() not in IMAGES or info.file_size < 12 * 1024: continue
-            target = work / f"embedded-{len(found)}{Path(name).suffix.lower()}"
-            target.write_bytes(archive.read(name))
+            # The header gives the size: small pictures are never copied out, large ones are streamed.
             try:
-                with Image.open(target) as im:
+                with archive.open(info) as member, Image.open(member) as im:
                     if min(im.size) < minimum: continue
             except Exception:
                 continue
+            target = work / f"embedded-{len(found)}{Path(name).suffix.lower()}"
+            with archive.open(info) as member, target.open("wb") as out: shutil.copyfileobj(member, out, 1 << 20)
             found.append(target)
             if len(found) >= limit: break
     return found
@@ -261,22 +344,45 @@ def pdf_images(path, minimum=256, limit=40):
     return pages
 
 
-def image(path, dest, budget=140):
+def fit(width, height, budget):
+    """Tamaño para el modelo: unos `budget` bloques de 48×48 px con la proporción original."""
+    factor = math.sqrt(budget * 48 * 48 / (width * height))
+    target_width = int(width * factor / 48) * 48
+    target_height = int(height * factor / 48) * 48
+    if not target_height:
+        target_height = 48
+        target_width = min(width // height * 48, budget * 48)
+    elif not target_width:
+        target_width = 48
+        target_height = min(height // width * 48, budget * 48)
+    return target_width, target_height
+
+
+def oriented(path, budget):
+    """Imagen en RGB y orientada, más su tamaño original (orientado), decodificada solo
+    lo necesario para `budget`: un JPEG grande se lee a 1/2, 1/4 u 1/8 sin bajar del doble del destino."""
     with Image.open(path) as source:
-        bitmap = ImageOps.exif_transpose(source).convert("RGB")
-        width, height = bitmap.size
+        width, height = source.size
         factor = math.sqrt(budget * 48 * 48 / (width * height))
-        target_width = int(width * factor / 48) * 48
-        target_height = int(height * factor / 48) * 48
-        if not target_height:
-            target_height = 48
-            target_width = min(width // height * 48, budget * 48)
-        elif not target_width:
-            target_width = 48
-            target_height = min(height // width * 48, budget * 48)
-        bitmap = bitmap.resize((target_width,target_height),Image.Resampling.BICUBIC)
-        bitmap.save(dest, "PNG")
+        if factor < .5: source.draft(source.mode, (math.ceil(width * factor * 2), math.ceil(height * factor * 2)))
+        if source.getexif().get(0x0112, 1) in {5, 6, 7, 8}: width, height = height, width  # EXIF rotation
+        ImageOps.exif_transpose(source, in_place=True)
+        bitmap = source.convert("RGB")
+    # «1», «L» or «RGB» PNGs with tRNS keep an int/bytes transparency after convert() and saving fails
+    # («transparency for RGB must be list or tuple»). The model gets opaque RGB anyway.
+    bitmap.info.pop("transparency", None)
+    return bitmap, (width, height)
+
+
+def scaled(bitmap, size, dest, budget):
+    # Temporary file read once: fast compression, same pixels.
+    bitmap.resize(fit(*size, budget), Image.Resampling.BICUBIC).save(dest, "PNG", compress_level=1)
     return dest
+
+
+def image(path, dest, budget=140):
+    bitmap, size = oriented(path, budget)
+    return scaled(bitmap, size, dest, budget)
 
 
 def thumbnail_path(path, loc=None):
@@ -343,6 +449,18 @@ def give_back(engine):
     _pool.put(engine)
 
 
+def trim():
+    """Devuelve al sistema la memoria libre del montón (ONNX deja cientos de MB tras cada OCR)."""
+    try: _libc().malloc_trim(0)
+    except (OSError, AttributeError): pass
+
+
+@functools.cache
+def _libc():
+    import ctypes
+    return ctypes.CDLL("libc.so.6")
+
+
 def release_ocr():
     """Libera las instancias inactivas; se recrean al volver a necesitarlas."""
     global _created
@@ -353,15 +471,22 @@ def release_ocr():
             _created -= 1
     import gc
     gc.collect()
+    trim()
 
 
-def tesseract(path):
+@functools.cache
+def tesseract_args():
+    """Datos y idiomas de Tesseract: se consultan una vez, no en cada página."""
     from .config import DATA
     local = DATA / 'tessdata'
     args = ['--tessdata-dir', str(local)] if (local / 'spa.traineddata').exists() and (local / 'eng.traineddata').exists() else []
     languages = command(["tesseract", *args, "--list-langs"]).splitlines()[1:]
     selected = "+".join(x for x in ["spa", "eng"] if x in languages) or languages[0]
-    return command(["tesseract", str(path), "stdout", *args, "-l", selected], timeout=60).strip()
+    return (*args, "-l", selected)
+
+
+def tesseract(path):
+    return command(["tesseract", str(path), "stdout", *tesseract_args()], timeout=60).strip()
 
 
 def ocr(path):
@@ -374,6 +499,7 @@ def ocr(path):
             pass
         finally:
             give_back(engine)
+            trim()
     return tesseract(path)
 
 
@@ -395,27 +521,32 @@ def extract(path, kind, config, stop=None, cursor=None):
             yield item
 
     if kind in {"document", "code"}:
-        text = document(path)
-        if "-----BEGIN " in text and "PRIVATE KEY-----" in text:
-            raise ValueError("Archivo con clave privada excluido")
-        yield from section(chunks(text, kind),0)
+        if position[0] == 0:
+            from .textcache import DOCUMENT_TEXT
+            text = DOCUMENT_TEXT.get(path, document)
+            if "-----BEGIN " in text and "PRIVATE KEY-----" in text:
+                raise ValueError("Archivo con clave privada excluido")
+            yield from section(chunks(text, kind),0)
         if kind == "document" and config["media"] and path.suffix.lower() in ARCHIVE_MEDIA:
             with tempfile.TemporaryDirectory(prefix="cati-") as work:
-                pictures = []
                 for index, picture in enumerate(embedded_images(path, Path(work))):
+                    if (1, index) < position: continue  # already indexed in an earlier batch
                     dest = image(picture, Path(work) / f"model-{index}.png", 140)
-                    pictures.append(Segment("Imagen dentro del documento", "doc-image", media=str(dest)))
-                yield from section(pictures, 1)
+                    picture.unlink()
+                    yield Segment("Imagen dentro del documento", "doc-image", media=str(dest), cursor=(1, index + 1))
         return
     with tempfile.TemporaryDirectory(prefix="cati-") as work:
         work = Path(work)
         if kind == "image":
             screenshot = path.name.lower().startswith(('screenshot','screen shot','captura','cleanshot','scr-'))
-            dest = image(path, work / "image.png",280 if screenshot else 140)
+            # Decoded once for both sizes; the bitmap is freed before the model embeds the first.
+            bitmap, size = oriented(path, 560)
+            dest = scaled(bitmap, size, work / "image.png", 280 if screenshot else 140)
+            # OCR needs readable text rather than the smaller vision token budget.
+            ocr_dest = scaled(bitmap, size, work / "ocr.png", 560)
+            del bitmap
             yield from section([Segment(path.stem, "image", media=str(dest))],0)
             cancelled()
-            # OCR needs readable text rather than the smaller vision token budget.
-            ocr_dest = image(path,work/'ocr.png',560)
             text = ocr(ocr_dest)
             if text: yield from section(chunks(text,"ocr"),1)
         elif kind == "pdf":
@@ -452,6 +583,7 @@ def extract(path, kind, config, stop=None, cursor=None):
                         if local < len(extracted):
                             dest = image(extracted[local], work / f"photo-model-{index}.png", 140)
                             pieces.append(Segment(f"Imagen en la página {page}", "doc-image", page, media=str(dest)))
+                    for old in extracted: old.unlink()  # full-size originals: not kept while the page is embedded
                 pieces.extend(chunks(text,"pdf",page))
                 yield from section(pieces,page)
         elif kind in {"audio", "video"}:
@@ -473,6 +605,10 @@ def extract(path, kind, config, stop=None, cursor=None):
                 if second >= length: break
                 cancelled()
                 dest = work / "audio.wav"
-                command(["ffmpeg", "-v", "error", "-y", "-ss", str(second), "-i", str(path), "-t", "30", "-vn", "-ac", "1", "-ar", "16000", str(dest)])
+                command(["ffmpeg", "-v", "error", "-y", "-ss", str(second), "-i", str(path), "-t", "30", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dest)])
+                # A video can continue after its audio stream ends. FFmpeg then
+                # writes an empty WAV; sending it to the model caused endless 500 retries.
+                with wave.open(str(dest),'rb') as audio:
+                    if not audio.getnframes(): break
                 yield Segment(f"Audio en {second}–{min(second + 30, length):.0f} s", "audio", second,
                               min(second + 30, length), media=str(dest),cursor=(phase,ordinal+1))

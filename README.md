@@ -36,9 +36,15 @@ Todo ocurre en tu equipo: no hay nube, cuentas ni telemetría.
 - **Búsqueda por voz.** Pulsa **Super + Alt + V** (o Alt + V con Cati abierta, o el micrófono), habla y suelta: se detiene sola al callarte y transcribe en tu equipo con [whisper.cpp](https://github.com/ggml-org/whisper.cpp) por GPU en unos 350 ms. Entiende búsquedas («búscame la factura del dentista») y órdenes sobre los resultados: «abre el segundo», «muéstralo en su carpeta», «propiedades», «siguiente», «bórralo», «cierra». En reposo no consume nada.
 - **Tolera erratas.** «piramdes», «lactnte febril» o «egpto» encuentran lo que querías, marcado como *nombre aproximado*.
 - **Lee dentro de todo.** Texto, Markdown, HTML, PDF (incluidas sus fotos, por página), DOCX, XLSX, PPTX, ODT, ODS, ODP, EPUB, RTF y DOC (con `antiword`). Las imágenes incrustadas en documentos se buscan por lo que muestran.
-- **Gestiona lo que encuentra.** Renombrar (F2), mover a otra carpeta (Ctrl + M) o enviar a la papelera (Ctrl + Supr), siempre con *Deshacer*.
+- **Es también un explorador.** Una barra lateral con tus lugares y discos, migas de pan, atrás/adelante y orden por nombre, fecha, tamaño o tipo. Escribe dentro de una carpeta y la búsqueda se limita a ella (incluso en discos que no se indexan: entonces mira el disco al momento).
+- **Filtros y búsquedas guardadas.** Acota por fecha (hoy, 7 días, 30 días, este año) y tamaño (pequeños, grandes, enormes) sin escribir nada. Guarda con ★ una consulta con sus filtros y vuelve a ella en un clic desde la barra lateral: se ejecuta de nuevo cada vez, como una carpeta inteligente.
+- **Recientes y más usados.** Cati recuerda, solo en tu equipo, qué abres y cuánto: «Abiertos hace poco» y «Más usados» están a un clic, y lo que abres a menudo sube un poco al ordenar.
+- **Acciones sobre varios archivos.** Marca con Ctrl + Espacio, Ctrl + clic o Mayús + clic y aplica a todos: mover, copiar, comprimir en ZIP, enviar a la papelera o renombrar en lote (buscar y reemplazar, numerar, mayúsculas o prefijo/sufijo) con vista previa de cada nombre. Nunca sobrescribe y todo se puede deshacer.
+- **Duplicados y espacio.** *Duplicados* encuentra archivos idénticos (mismo contenido, no solo mismo nombre; los enlaces duros no cuentan), muestra cuánto espacio recuperas y marca las copias sobrantes conservando la más antigua. *Espacio en disco* muestra qué carpetas ocupan más, con barras, y entras en ellas para seguir.
+- **Gestiona lo que encuentra.** Renombrar (F2), mover a otra carpeta (Ctrl + M), copiar (Ctrl + Mayús + M), comprimir (Ctrl + E) o enviar a la papelera (Ctrl + Supr), siempre con *Deshacer*.
 - **Propiedades completas.** Con *Propiedades* (Alt + Enter o clic derecho) ves fechas (incluida la de creación), permisos, propietario, cámara, objetivo y GPS de las fotos, autor y páginas de los PDF, códecs de vídeo y audio, autor de documentos de Office y, con ExifTool instalado, todos los metadatos EXIF, XMP, IPTC, QuickTime o ID3. Un clic en cualquier valor lo copia.
 - **Ordena con criterio.** Combina nombre, palabras y significado, agrupa copias y versiones repetidas («+2 copias») y premia el archivo cuyo nombre contiene lo que escribiste.
+- **Caché de nombres e índice incremental.** El catálogo persiste entre aperturas. Crear, mover o borrar una carpeta actualiza solo su subárbol; una revisión periódica recupera eventos perdidos. Las búsquedas reservan candidatos para nombres de carpetas y coincidencias completas, y comparten una caché de hasta 16 consultas y 6.000 candidatos entre las pasadas rápida y semántica. Los cambios del índice invalidan esa caché automáticamente.
 - **Ligera y rápida analizando.**
   - Las copias exactas (backups, descargas repetidas) se analizan una sola vez; en un equipo real eran un 34 % de los archivos.
   - Los embeddings usan la GPU por Vulkan (AMD, NVIDIA o Intel) y, si no hay, la CPU. En equipos NVIDIA el OCR también va por GPU.
@@ -73,13 +79,13 @@ No necesita root salvo para `--deps`.
 
 Funciona en Wayland y X11, con o sin systemd. `cati doctor` diagnostica en cualquier momento lo que falta.
 
-Opciones: `--gpu auto|vulkan|cpu`, `--shortcut "SUPER ALT, U"` (Hyprland) o `"<Super><Alt>u"` (GNOME), `--no-shortcut`, `--uninstall [--purge]`.
+Opciones: `--gpu auto|vulkan|cpu`, `--shortcut "SUPER ALT, E"` (Hyprland) o `"<Super><Alt>e"` (GNOME), `--no-shortcut`, `--uninstall [--purge]`.
 
 ### Omarchy y Hyprland
 
-Cati usa los colores del tema activo de Omarchy y los relee cada vez que se abre, de modo que cambiar de tema se nota al momento. Aparece en Walker y se abre con **Super + Alt + U**, como ventana flotante centrada. En Hyprland, el instalador escribe `~/.config/hypr/cati.conf` (reglas de ventana, atajo y arranque residente) y lo incluye desde `hyprland.conf` con copia de seguridad. Si Hyprland rechaza la configuración, la revierte.
+Cati usa los colores del tema activo de Omarchy y los relee cada vez que se abre, de modo que cambiar de tema se nota al momento. Aparece en Walker y tiene dos accesos: **Super + Alt + E** abre el **E**xplorador de archivos a pantalla completa, con barra lateral, y **Super + Alt + B** la **B**úsqueda rápida, en ventana flotante centrada. **Super + Alt + V** busca por voz. Dentro de Cati, **F11** (o el botón junto a los ajustes) pasa de un modo a otro. En Hyprland, el instalador escribe `~/.config/hypr/cati.conf` (reglas de ventana, atajo y arranque residente) y lo incluye desde `hyprland.conf` con copia de seguridad. Si Hyprland rechaza la configuración, la revierte.
 
-En GNOME configura el atajo automáticamente. En KDE lo propone en la entrada de la aplicación. En el resto de escritorios basta con asignar un atajo al comando `cati gui`.
+En GNOME configura los atajos automáticamente. En KDE los propone en la entrada de la aplicación. En el resto de escritorios basta con asignar atajos a `cati explorer` (explorador) y `cati quick` (búsqueda rápida).
 
 ## Uso
 
@@ -87,16 +93,21 @@ En GNOME configura el atajo automáticamente. En KDE lo propone en la entrada de
 | --- | --- |
 | Escribir | Buscar (no hace falta pulsar Enter) |
 | ↑ ↓, RePág, AvPág | Moverse por los resultados |
-| Enter | Abrir (PDF en su página, vídeo en su instante) |
-| Ctrl + Enter | Mostrar en su carpeta |
-| Ctrl + C | Copiar el archivo y su ruta |
+| Enter | Abrir (PDF en su página, vídeo en su instante); en una carpeta, entrar en ella |
+| Ctrl + Enter | Mostrar en el gestor de archivos |
+| Alt + ←, Alt + →, Alt + ↑, Retroceso | Atrás, adelante y carpeta superior (con la caja vacía) |
+| Ctrl + B | Mostrar u ocultar la barra lateral |
+| Ctrl + S | Guardar la búsqueda y sus filtros |
+| Ctrl + Espacio, Insertar, Mayús + ↑ ↓ | Marcar (y avanzar); Ctrl + A marca todo con la caja vacía |
+| Ctrl + C | Copiar el archivo y su ruta (todos los marcados, si los hay) |
 | Tab, Shift + Tab | Cambiar de tipo (Todo, Carpetas, Documentos, Imágenes…) |
 | Alt + Enter, clic derecho | Propiedades y metadatos |
 | Alt + V | Buscar por voz (Super + Alt + V desde cualquier sitio) |
-| F2, Ctrl + M, Ctrl + Supr | Renombrar, mover, papelera |
+| F2, Ctrl + M, Ctrl + Mayús + M, Ctrl + E, Ctrl + Supr | Renombrar, mover, copiar, comprimir, papelera (sobre lo marcado o el resultado actual) |
 | Ctrl + Z | Deshacer la última acción de archivo |
 | Alt + ← → | Página anterior o siguiente en PDF |
-| Esc | Cerrar (Cati sigue residente) |
+| Esc | Quitar la selección y, si no hay, cerrar (Cati sigue residente) |
+| F11 | Pasar del explorador a pantalla completa a la búsqueda rápida, y al revés |
 
 También puedes **arrastrar** un resultado a otra aplicación, o **soltar una foto** en la ventana para buscar imágenes parecidas.
 
@@ -166,11 +177,20 @@ Las páginas HTML se renderizan para la vista previa con Chromium sin perfil y *
 | `media` | `true` | Analizar imágenes, audio y vídeo |
 | `code` | `false` | Analizar código fuente (búsquedas con `code:`) |
 | `theme` | `"auto"` | `auto`: tema de Omarchy si existe; `cati`: paleta propia |
-| `workers` | automático | Trabajos de análisis simultáneos |
+| `workers` | `1` | Trabajos de análisis simultáneos; un trabajador evita picos de memoria |
+| `scan_seconds` | `1800` | Revisión completa de respaldo; inotify procesa novedades entre revisiones |
+| `scan_debounce_seconds` | `30` | Pausa mínima entre revisiones durante ráfagas de nuevas carpetas |
+| `job_delay` | `0.25` | Descanso entre lotes de análisis en segundo plano |
+| `background_duty` | `0.25` | Ritmo del motor durante la indexación: descansa entre solicitudes; las búsquedas no esperan |
 | `engine_idle` | `900` | Segundos sin uso antes de liberar el modelo |
 | `exclude` | — | Rutas que nunca se recorren |
 
 Datos en `~/.local/share/cati/`: índice, miniaturas y modelos.
+
+El texto extraído se reutiliza entre lotes y reinicios. La caché ocupa como máximo 16 MiB en RAM
+y 128 MiB en `~/.cache/cati/text-v1/`; cambia automáticamente cuando cambia el archivo.
+La vigilancia usa prioridad e I/O bajos y un máximo de 35 % de **un hilo** de CPU, no del equipo
+completo. Las descargas de dependencias de Go (`$GOPATH/pkg`) se excluyen del análisis.
 
 ## Desinstalar
 
@@ -184,8 +204,24 @@ Datos en `~/.local/share/cati/`: índice, miniaturas y modelos.
 ```bash
 python -m unittest tests.test_query              # sin modelo (lo que corre en CI)
 PYTHONPATH=.:tests .venv/bin/python -m unittest test_integration test_quality   # con el modelo real
+.venv/bin/python -m unittest tests.test_files    # explorador, lotes, duplicados y espacio (sin modelo)
+.venv/bin/python tests/gui_explorer.py           # prueba la ventana de verdad (necesita sesión gráfica)
 ```
 
 ## Licencia
 
 [MIT](LICENSE). Los componentes de terceros y sus licencias están en [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+### Arranque y cachés de búsqueda
+
+El explorador y las búsquedas de texto cargan únicamente los metadatos necesarios;
+los vectores se abren al solicitar búsqueda semántica. Abrir una ventana no despierta
+el modelo. La primera consulta semántica puede tardar más si el motor estaba dormido.
+Los vectores se leen y compactan por lotes; las imágenes de consulta invalidan su
+caché cuando cambia el archivo. Los identificadores de fragmentos son monotónicos
+para que una modificación nunca herede el vector de un fragmento borrado.
+
+Al ocultar/cerrar la ventana, Cati conserva la navegación y descarga tras 60 segundos
+los vectores de búsqueda y las cachés de miniaturas/vistas previas. Reabrir antes
+cancela esa descarga; después, los vectores se recuperan desde disco cuando se
+necesitan. El vigilante de archivos funciona independientemente de la ventana.

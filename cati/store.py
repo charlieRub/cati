@@ -65,6 +65,24 @@ def connect(path=None, threads=False):
         # Creation date (statx btime): «lo que creé en marzo». NULL until the next catalog pass fills it.
         add_column(db, 'catalog', 'btime', 'INTEGER')
         db.executescript('CREATE INDEX IF NOT EXISTS catalog_btime ON catalog(btime); PRAGMA user_version=5;')
+    if db.execute('PRAGMA user_version').fetchone()[0] < 6:
+        # What you open and how often: «recientes», «más usados» and a gentle ranking nudge.
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS usage (path TEXT PRIMARY KEY, opens INTEGER NOT NULL, last INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS usage_last ON usage(last);
+            PRAGMA user_version=6;
+        """)
+    if db.execute('PRAGMA user_version').fetchone()[0] < 7:
+        # File previews, replacement, copies and cascading deletion all select by file.
+        db.executescript('CREATE INDEX IF NOT EXISTS segments_file ON segments(file); PRAGMA user_version=7;')
+    if db.execute('PRAGMA user_version').fetchone()[0] < 8:
+        db.executescript("""
+            INSERT OR IGNORE INTO meta(key,value) SELECT 'segment_sequence',COALESCE(max(id),0) FROM segments;
+            CREATE TRIGGER IF NOT EXISTS segments_sequence AFTER INSERT ON segments BEGIN
+              UPDATE meta SET value=max(CAST(value AS INTEGER),new.id) WHERE key='segment_sequence';
+            END;
+            PRAGMA user_version=8;
+        """)
     row = db.execute("SELECT value FROM meta WHERE key='fingerprint'").fetchone()
     if row and row[0] != FINGERPRINT:
         db.close()
@@ -74,6 +92,11 @@ def connect(path=None, threads=False):
     db.commit()
     path.chmod(0o600)
     return db
+
+
+def next_segment_id(db):
+    """Reserve inside the caller's transaction; deleted vector IDs must never be reused."""
+    return db.execute("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='segment_sequence' RETURNING value").fetchone()[0]
 
 
 @contextmanager

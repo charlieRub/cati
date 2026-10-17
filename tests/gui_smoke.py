@@ -25,7 +25,9 @@ def capture():
     width, height = window.get_width(), window.get_height()
     snapshot = Gtk.Snapshot()
     Gtk.WidgetPaintable.new(window).snapshot(snapshot, width, height)
-    texture = window.get_renderer().render_texture(snapshot.to_node(), Graphene.Rect().init(0, 0, width, height))
+    node = snapshot.to_node()
+    if node is None: return None   # la ventana aún no ha pintado nada: la captura es opcional
+    texture = window.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, width, height))
     path = Path(tempfile.gettempdir()) / 'cati-smoke.png'
     texture.save_to_png(str(path))
     return path

@@ -25,6 +25,7 @@ HYPR_FILE = HYPR / 'cati.conf'
 SOURCE_LINE = 'source = ~/.config/hypr/cati.conf'
 GNOME_PATH = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/cati/'
 GNOME_VOICE = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/cati-voice/'
+GNOME_SEARCH = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/cati-search/'
 
 
 def environment():
@@ -56,15 +57,19 @@ Type=Application
 Name=Cati
 GenericName=Buscador de archivos
 Comment=Encuentra cualquier archivo describiéndolo con tus palabras
-Exec={LAUNCHER} gui
+Exec={LAUNCHER} explorer
 Icon={APP_ID}
 Terminal=false
 Categories=Utility;FileTools;
 Keywords=search;find;files;buscar;archivos;documentos;fotos;
 StartupNotify=false
 StartupWMClass={APP_ID}
-X-KDE-Shortcuts=Meta+Alt+U
-Actions=voice;
+X-KDE-Shortcuts=Meta+Alt+E
+Actions=search;voice;
+
+[Desktop Action search]
+Name=Búsqueda rápida
+Exec={LAUNCHER} quick
 
 [Desktop Action voice]
 Name=Buscar por voz
@@ -99,7 +104,22 @@ def hyprland_version():
         return (0, 0)
 
 
-def install_hyprland(binding='SUPER ALT, U'):
+def hyprland_rules(new_syntax):
+    """El explorador se maximiza y la búsqueda flota centrada; el título distingue los dos modos."""
+    pattern = APP_ID.replace('.', r'\.')
+    explorer, search = '^Cati$', '^Cati · Buscar$'
+    if new_syntax:
+        rules = [(f'^{pattern}$', None, 'opacity 1.0 override'), (f'^{pattern}$', explorer, 'maximize on')]
+        rules += [(f'^{pattern}$', search, effect) for effect in ('float on', 'center on', 'size 1240 780')]
+        return '\n'.join(f'windowrule = {effect}, match:class {cls}' + (f', match:title {title}' if title else '')
+                         for cls, title, effect in rules)
+    rules = [(None, 'opacity 1.0 override 1.0 override'), (explorer, 'maximize')]
+    rules += [(search, effect) for effect in ('float', 'center', 'size 1240 780')]
+    return '\n'.join(f'windowrulev2 = {effect}, class:^({pattern})$' + (f', title:({title})' if title else '')
+                     for title, effect in rules)
+
+
+def install_hyprland(binding='SUPER ALT, E'):
     if not (HYPR / 'hyprland.conf').exists(): return 'No se encontró ~/.config/hypr/hyprland.conf'
     mods, key = [part.strip() for part in binding.split(',', 1)]
     try:
@@ -107,19 +127,16 @@ def install_hyprland(binding='SUPER ALT, U'):
         wanted = set(mods.upper().split())
         names = {'SUPER': 64, 'ALT': 8, 'CTRL': 4, 'CONTROL': 4, 'SHIFT': 1}
         mask = sum(names.get(m, 0) for m in wanted)
-        taken = [b for b in binds if b.get('modmask') == mask and b.get('key', '').lower() in {key.lower(), 'v'} and 'cati' not in b.get('arg', '')]
+        taken = [b for b in binds if b.get('modmask') == mask and b.get('key', '').lower() in {key.lower(), 'b', 'v'} and 'cati' not in b.get('arg', '')]
         if taken: return f'{binding} ya está ocupado por «{taken[0].get("description") or taken[0].get("arg")}»; elige otro con --shortcut'
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
-    pattern = APP_ID.replace('.', r'\.')
-    if hyprland_version() >= (0, 53):
-        rules = '\n'.join(f'windowrule = {rule}, match:class ^{pattern}$' for rule in ('float on', 'center on', 'size 1240 780', 'opacity 1.0 override'))
-    else:
-        rules = '\n'.join(f'windowrulev2 = {rule}, class:^({pattern})$' for rule in ('float', 'center', 'size 1240 780', 'opacity 1.0 override 1.0 override'))
+    rules = hyprland_rules(hyprland_version() >= (0, 53))
     previous = HYPR_FILE.read_text() if HYPR_FILE.exists() else None
-    HYPR_FILE.write_text(f'''# Cati: ventana flotante centrada, atajo y arranque residente
+    HYPR_FILE.write_text(f'''# Cati: explorador maximizado, búsqueda flotante, atajos y arranque residente
 {rules}
-bindd = {mods}, {key}, Cati: buscar archivos, exec, {LAUNCHER} gui
+bindd = {mods}, {key}, Cati: explorador de archivos, exec, {LAUNCHER} explorer
+bindd = {mods}, B, Cati: búsqueda rápida, exec, {LAUNCHER} quick
 bindd = {mods}, V, Cati: buscar por voz, exec, {LAUNCHER} voice
 exec-once = {LAUNCHER} gui --background
 ''')
@@ -139,12 +156,13 @@ exec-once = {LAUNCHER} gui --background
     return None
 
 
-def install_gnome(binding='<Super><Alt>u'):
+def install_gnome(binding='<Super><Alt>e'):
     if not shutil.which('gsettings'): return 'gsettings no está disponible'
     schema = 'org.gnome.settings-daemon.plugins.media-keys'
     current = subprocess.run(['gsettings', 'get', schema, 'custom-keybindings'], capture_output=True, text=True).stdout.strip()
     paths = re.findall(r"'([^']+)'", current)
-    entries = ((GNOME_PATH, 'Cati', 'gui', binding), (GNOME_VOICE, 'Cati: buscar por voz', 'voice', '<Super><Alt>v'))
+    entries = ((GNOME_PATH, 'Cati: explorador', 'explorer', binding), (GNOME_SEARCH, 'Cati: búsqueda rápida', 'quick', '<Super><Alt>b'),
+               (GNOME_VOICE, 'Cati: buscar por voz', 'voice', '<Super><Alt>v'))
     for path, *_ in entries:
         if path not in paths: paths.append(path)
     subprocess.run(['gsettings', 'set', schema, 'custom-keybindings', str(paths)], check=True)
@@ -162,18 +180,19 @@ def integrate(shortcut=True, binding=None):
     session = environment()
     if session == 'hyprland':
         if shortcut:
-            problem = install_hyprland(binding or 'SUPER ALT, U')
-            notes.append(problem or 'Hyprland: Super+Alt+U abre Cati y Super+Alt+V busca por voz; se queda residente al iniciar sesión.')
+            problem = install_hyprland(binding or 'SUPER ALT, E')
+            notes.append(problem or 'Hyprland: Super+Alt+E abre el explorador, Super+Alt+B la búsqueda rápida y Super+Alt+V busca por voz; '
+                                    'se queda residente al iniciar sesión.')
             if omarchy(): notes.append('Omarchy: Cati usa los colores de tu tema y aparece en Walker.')
     else:
         install_autostart()
         if shortcut and session == 'gnome':
-            problem = install_gnome(binding or '<Super><Alt>u')
-            notes.append(problem or 'GNOME: Super+Alt+U abre Cati y Super+Alt+V busca por voz.')
+            problem = install_gnome(binding or '<Super><Alt>e')
+            notes.append(problem or 'GNOME: Super+Alt+E abre el explorador, Super+Alt+B la búsqueda rápida y Super+Alt+V busca por voz.')
         elif shortcut and session == 'kde':
-            notes.append('KDE: Meta+Alt+U queda propuesto en la entrada de Cati; confírmalo en Preferencias › Atajos si no se activa.')
+            notes.append('KDE: Meta+Alt+E queda propuesto en la entrada de Cati; confírmalo en Preferencias › Atajos si no se activa.')
         elif shortcut:
-            notes.append('Asigna un atajo de tu escritorio al comando «cati gui».')
+            notes.append('Asigna atajos de tu escritorio a «cati explorer» (explorador) y «cati quick» (búsqueda rápida).')
     return notes
 
 
@@ -189,5 +208,5 @@ def remove():
     if environment() == 'gnome' and shutil.which('gsettings'):
         schema = 'org.gnome.settings-daemon.plugins.media-keys'
         current = subprocess.run(['gsettings', 'get', schema, 'custom-keybindings'], capture_output=True, text=True).stdout
-        paths = [p for p in re.findall(r"'([^']+)'", current) if p not in {GNOME_PATH, GNOME_VOICE}]
+        paths = [p for p in re.findall(r"'([^']+)'", current) if p not in {GNOME_PATH, GNOME_SEARCH, GNOME_VOICE}]
         subprocess.run(['gsettings', 'set', schema, 'custom-keybindings', str(paths)], capture_output=True)

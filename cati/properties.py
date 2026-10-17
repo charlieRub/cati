@@ -268,6 +268,8 @@ def words(tag):
 def everything(path):
     """Todos los metadatos que conoce ExifTool, agrupados por origen (EXIF, XMP, IPTC, QuickTime…)."""
     if not shutil.which('exiftool'): return None
+    if not regular(path) and not Path(path).is_dir(): return []
+    path = Path(path).absolute()
     try:
         data = json.loads(output(['exiftool', '-j', '-a', '-G1', '-charset', 'filename=utf8', '-api', 'LargeFileSupport=1',
                                   str(path)], 20) or '[]')
@@ -285,13 +287,20 @@ def everything(path):
     return sorted(groups.items(), key=lambda item: (item[0] == 'Composite', item[0]))
 
 
+def regular(path):
+    """¿Archivo normal? Abrir una tubería con nombre («fifo.txt») o un dispositivo bloquearía para siempre."""
+    try: return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError: return False
+
+
 def collect(path, kind):
-    path = Path(path)
+    path = Path(path).absolute()   # never a name starting with «-» that file/stat/ffprobe would take as an option
     is_dir = path.is_dir()
     sections = [('General', general(path, is_dir))]
     detail = []
     try:
         if is_dir: detail = folder(path)
+        elif not regular(path): detail = []
         elif kind == 'image': detail = image(path)
         elif kind == 'pdf': detail = pdf(path)
         elif kind in {'video', 'audio'}: detail = media(path)
@@ -306,5 +315,6 @@ def collect(path, kind):
 
 def sha256(path):
     import hashlib
+    if not regular(path): raise OSError('no es un archivo normal')
     with open(path, 'rb') as handle:
         return hashlib.file_digest(handle, 'sha256').hexdigest()

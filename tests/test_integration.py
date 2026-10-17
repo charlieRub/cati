@@ -14,7 +14,7 @@ from cati.config import DEFAULTS
 from cati.engine import Engine
 from cati.indexer import index
 from cati.readers import walk, chunks
-from cati.search import search
+from cati.search import forget, search
 from cati.store import connect, opened
 
 
@@ -71,7 +71,9 @@ class Integration(unittest.TestCase):
         cls.first = index(cls.config, db_path=cls.db, engine=cls.engine)
 
     @classmethod
-    def tearDownClass(cls): cls.temp.cleanup()
+    def tearDownClass(cls):
+        forget(cls.db)
+        cls.temp.cleanup()
 
     def test_01_modalities_and_pdf_location(self):
         self.assertEqual(self.first['errors'], 0)

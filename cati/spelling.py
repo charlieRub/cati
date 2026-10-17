@@ -8,6 +8,7 @@ frecuentes que son en tus archivos y en el idioma de la frase.
 
 El servicio de indexación construye el vocabulario y lo guarda en disco; la interfaz solo lo carga.
 """
+import bisect
 import hashlib
 import math
 import os
@@ -116,19 +117,44 @@ def plausible(word):
     return 3 <= len(word) <= 24 and re.search(r'[aeiouy]', word) and not re.search(r'[^aeiouy]{5}', word)
 
 
+class Words:
+    """Lista ordenada de palabras guardada como una sola cadena con sus límites: 170 000 str sueltas
+    y su diccionario de posiciones ocupaban unos 25 MB; así, menos de 3. Se busca por bisección."""
+
+    def __init__(self, words):
+        self.text = words if isinstance(words, str) else '\n'.join(words)
+        breaks = np.flatnonzero(np.frombuffer(self.text.encode('utf-32-le'), np.uint32) == 10) if self.text else np.zeros(0, np.int64)
+        count = len(breaks) + 1 if self.text else 0
+        self.starts = np.zeros(count, np.int32)
+        self.starts[1:] = breaks + 1
+        self.ends = np.append(breaks, len(self.text)).astype(np.int32) if count else np.zeros(0, np.int32)
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, i):
+        return self.text[self.starts[i]:self.ends[i]]
+
+    def __iter__(self):
+        return iter(self.text.split('\n') if self.text else ())
+
+    def index(self, word):
+        i = bisect.bisect_left(self, word)
+        return i if i < len(self.starts) and self[i] == word else None
+
+
 class Lexicon:
     """Vocabulario de tu equipo: frecuencia en nombres, en contenido y en el idioma de cada palabra."""
 
     def __init__(self, words, name_df, content_df, spanish, english, keyword, display, gram_list, offsets, postings):
         self.strong, self.weak = (np.load(DATA / 'dict' / n) if (DATA / 'dict' / n).exists() else None
                                   for n in ('strong.npy', 'weak.npy'))
-        self.words = words
-        self.position = {w: i for i, w in enumerate(words)}
+        self.words = words if isinstance(words, Words) else Words(words)  # sorted
         self.name_df, self.content_df, self.spanish, self.english, self.keyword = name_df, content_df, spanish, english, keyword
         self.display = display
         self.gram_code = {g: i for i, g in enumerate(gram_list)}
         self.offsets, self.postings = offsets, postings
-        self.lengths = np.fromiter((len(w) for w in words), np.int16, len(words))
+        self.lengths = (self.words.ends - self.words.starts).astype(np.int16)
 
     # ------------------------------------------------------------ construcción
     @classmethod
@@ -161,7 +187,7 @@ class Lexicon:
     def save(self, path):
         temporary = path.with_name(path.name + '.tmp.npz')
         pairs = sorted(self.display.items())
-        np.savez(temporary, words='\n'.join(self.words), name_df=self.name_df, content_df=self.content_df,
+        np.savez(temporary, words=self.words.text, name_df=self.name_df, content_df=self.content_df,
                  spanish=self.spanish, english=self.english, keyword=self.keyword,
                  display_keys='\n'.join(k for k, _ in pairs), display_values='\n'.join(v for _, v in pairs),
                  grams='\n'.join(g for g in self.gram_code), offsets=self.offsets, postings=self.postings)
@@ -172,13 +198,13 @@ class Lexicon:
     def load(cls, path):
         with np.load(path) as data:
             split = lambda key: str(data[key]).split('\n') if str(data[key]) else []
-            return cls(split('words'), data['name_df'], data['content_df'], data['spanish'], data['english'], data['keyword'],
+            return cls(Words(str(data['words'])), data['name_df'], data['content_df'], data['spanish'], data['english'], data['keyword'],
                        dict(zip(split('display_keys'), split('display_values'))), split('grams'), data['offsets'], data['postings'])
 
     # ------------------------------------------------------------------ consulta
     def known(self, word):
         """2: palabra de verdad (tuya o del idioma); 1: rara en el idioma («nefrología»); 0: desconocida."""
-        i = self.position.get(word)
+        i = self.words.index(word)
         if i is not None and (self.keyword[i] or self.spanish[i] or self.english[i] or self.name_df[i] or self.content_df[i] >= 3):
             return 2
         if contains(self.strong, word): return 2
@@ -186,12 +212,12 @@ class Lexicon:
 
     def frequency(self, word):
         """Cuántos nombres de archivo contienen la palabra (para pesar los términos raros)."""
-        i = self.position.get(word)
+        i = self.words.index(word)
         return int(self.name_df[i]) if i is not None else 0
 
     def documents(self, word):
         """En cuántos archivos analizados aparece la palabra dentro del contenido."""
-        i = self.position.get(word)
+        i = self.words.index(word)
         return int(self.content_df[i]) if i is not None else 0
 
     def prior(self, i, spanish):
@@ -201,9 +227,10 @@ class Lexicon:
         return (1.5 * math.log1p(self.name_df[i]) + math.log1p(self.content_df[i]) + .3 * language
                 + (4 if self.keyword[i] else 0))
 
-    def suggest(self, word, spanish=True, rare=False):
+    def suggest(self, word, spanish=True, rare=False, fits=None):
         """Mejor corrección de una palabra desconocida, o None si nada se parece lo bastante.
-        Con `rare` (la palabra existe pero es poco usada) solo vale una errata clara hacia algo de tus archivos."""
+        Con `rare` (la palabra existe pero es poco usada) solo vale una errata clara hacia algo de tus archivos.
+        `fits(candidato)` desempata entre las igual de cercanas: «test modue stubs» → «module», no «mode»."""
         limit = 1.0 if rare else allowance(word)
         codes = [self.gram_code[g] for g in grams(word) if g in self.gram_code]
         if not codes: return None
@@ -212,19 +239,26 @@ class Lexicon:
         close = np.nonzero((shared >= max(1, len(codes) - 3 * math.ceil(limit)))
                            & (np.abs(self.lengths - len(word)) <= math.ceil(limit)))[0]
         if len(close) > 80: close = close[np.argpartition(-shared[close], 80)[:80]]
-        best, best_score = None, None
+        ranked = []
         for i in close.tolist():
             if len(word) <= 3 and not self.keyword[i]: continue  # three letters only fix the parser's own words
             if rare and not (self.keyword[i] or self.name_df[i] or self.content_df[i] >= 2): continue
             cost = distance(word, self.words[i], limit)
             if cost > limit: continue
-            score = cost - .04 * self.prior(i, spanish)
-            if best_score is None or score < best_score: best, best_score = self.words[i], score
-        return best
+            ranked.append((cost - .04 * self.prior(i, spanish), cost, self.words[i]))
+        if not ranked: return None
+        ranked.sort()
+        if fits:
+            for _, cost, candidate in ranked[:6]:
+                if cost > ranked[0][1]: break  # only spellings as close as the best one compete
+                if fits(candidate): return candidate
+        return ranked[0][2]
 
-    def correct(self, query):
-        """(frase corregida, [(original, corrección)]). Respeta comillas, números, siglas, rutas y extensiones."""
+    def correct(self, query, together=None):
+        """(frase corregida, [(original, corrección)]). Respeta comillas, números, siglas, rutas y extensiones.
+        `together(palabra, otras)` dice si algún nombre las reúne: el resto de la frase decide un empate."""
         changes = []
+        words = [normalize(w) for w in WORD.findall(query)]
         quoted = [m.span() for m in re.finditer(r'"[^"]*"|«[^»]*»', query)]
         spanish = bool(SPANISH & set(normalize(query).split())) or not re.search(r'\b(?:the|of|and|with|from)\b', query.lower())
 
@@ -239,7 +273,9 @@ class Lexicon:
             if len(word) < 3: return token
             known = self.known(word)
             if known == 2: return token
-            fixed = self.suggest(word, spanish, rare=known == 1)
+            others = [w for w in words if w != word and len(w) >= 3]
+            fits = (lambda candidate: together(candidate, others)) if together and others else None
+            fixed = self.suggest(word, spanish, rare=known == 1, fits=fits)
             if not fixed or fixed == word: return token
             shown = self.display.get(fixed, fixed)
             if token[:1].isupper(): shown = shown[:1].upper() + shown[1:]

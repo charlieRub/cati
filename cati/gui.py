@@ -13,7 +13,6 @@ import subprocess
 import threading
 import time
 import tomllib
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -23,14 +22,19 @@ gi.require_version('Gdk', '4.0')
 gi.require_version('Gsk', '4.0')
 gi.require_version('Graphene', '1.0')
 gi.require_version('GtkSource', '5')
-from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gtk, GtkSource, Pango
+from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, GtkSource, Pango
 
-from . import preview, properties
-from .config import APP_ID, DATA, PROJECT, load, save
+from . import preview, properties, usage
+from .config import APP_ID, DATA, PROJECT, give_back_memory, load, save
 from .engine import mark_search
+from .explorer import Explorer, explorer_css
 from .query import normalize, stem
 from .search import searcher
 from .store import opened
+from .widgets import Squeezer, button, label, short_path
+
+RAW_IMAGES = {'.psd', '.xcf', '.raw', '.cr2', '.nef', '.dng', '.kra'}
+_STALE = object()   # trabajo de una vista previa que ya no se ve
 
 GLYPH = {'folder': '\U000F024B', 'document': '\U000F0219', 'pdf': '\U000F0226', 'image': '\U000F02E9',
          'video': '\U000F0567', 'audio': '\U000F0388', 'sheet': '\U000F021B', 'slides': '\U000F0227',
@@ -44,6 +48,7 @@ SINGULAR = {'folder': 'Carpeta', 'document': 'Documento', 'pdf': 'PDF', 'image':
             'archive': 'Comprimido', 'other': 'Archivo'}
 ORDER = ['all', 'folder', 'document', 'pdf', 'image', 'video', 'audio', 'sheet', 'slides', 'code', 'archive', 'other']
 SEARCH, COG, CAMERA, EXACT = '\U000F0349', '\U000F0493', '\U000F0100', '\U000F0B34'
+EXPAND, COLLAPSE = '\U000F0293', '\U000F0294'
 OPEN, FOLDER_OPEN, COPY, LEFT, RIGHT = '\U000F03CC', '\U000F0770', '\U000F018F', '\U000F0141', '\U000F0142'
 INFO = '\U000F02FD'
 MIC, RENAME, MOVE, TRASH, UNDO, MORE = '\U000F036C', '\U000F0CB6', '\U000F0255', '\U000F0A7A', '\U000F054C', '\U000F01D9'
@@ -222,24 +227,6 @@ def source_scheme(c):
     return manager.get_scheme('cati-theme')
 
 
-def label(text='', css=None, **props):
-    props.setdefault('xalign', 0)
-    item = Gtk.Label(label=text, **props)
-    for name in (css or '').split(): item.add_css_class(name)
-    return item
-
-
-def button(text, css, callback=None, tooltip=None, toggle=False):
-    widget = Gtk.ToggleButton() if toggle else Gtk.Button()
-    if isinstance(text, Gtk.Widget): widget.set_child(text)
-    else: widget.set_label(text)
-    for name in css.split(): widget.add_css_class(name)
-    if tooltip: widget.set_tooltip_text(tooltip)
-    if callback: widget.connect('toggled' if toggle else 'clicked', callback)
-    widget.set_cursor(Gdk.Cursor.new_from_name('pointer'))
-    return widget
-
-
 def accent_pattern(word):
     groups = {'a': 'aáàäâ', 'e': 'eéèëê', 'i': 'iíìïî', 'o': 'oóòöô', 'u': 'uúùüû', 'n': 'nñ', 'c': 'cç'}
     return ''.join(f'[{groups[ch]}]' if ch in groups else re.escape(ch) for ch in word)
@@ -276,14 +263,9 @@ def excerpt_markup(text, stems, color):
     text = ' '.join(text.split())
     if '«' in text:
         escaped = GLib.markup_escape_text(text)
-        return escaped.replace('«', f'<span foreground="{color}" weight="bold">').replace('»', '</span>')
+        # Snippets may end inside a quote, and source text can contain literal guillemets.
+        return re.sub(r'«([^«»]*)»', lambda match: f'<span foreground="{color}" weight="bold">{match[1]}</span>', escaped)
     return mark(text, stems, color)
-
-
-def short_path(path):
-    home = str(Path.home())
-    path = str(path)
-    return '~' + path[len(home):] if path.startswith(home) else path
 
 
 def open_path(path, kind=None, loc=None, folder=False):
@@ -313,12 +295,13 @@ def shutil_which(name):
     return shutil.which(name)
 
 
-class Cati(Gtk.Application):
+class Cati(Explorer, Gtk.Application):
     def __init__(self, background=False):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.background = background
         self.window = None
         self.searcher = None
+        self.window_hidden_event = threading.Event()
         self.search_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='cati-search')
         self.preview_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='cati-preview')
         self.thumb_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix='cati-thumb')
@@ -331,6 +314,9 @@ class Cati(Gtk.Application):
         self.query_image = None
         self.media = None
         self.textures = {}
+        self.preview_cache = preview.Textures()   # texturas grandes de la vista previa (fotos y páginas)
+        self.prefetch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='cati-prefetch')
+        self.last_selection = 0.0
         self.current = None
         self.searching = False
         self.stats = {}
@@ -340,15 +326,18 @@ class Cati(Gtk.Application):
         voice = Gio.SimpleAction.new('voice', None)
         voice.connect('activate', lambda *_: self.voice())
         self.add_action(voice)
-        for name, callback in (('rename', lambda *_: self.rename()), ('move', lambda *_: self.move_to()), ('trash', lambda *_: self.trash())):
-            action = Gio.SimpleAction.new(name, None)
-            action.connect('activate', callback)
-            self.add_action(action)
+        # «cati gui» abre el explorador y «cati gui --search» la ventana de búsqueda, también en la instancia residente.
+        show = Gio.SimpleAction.new('show-mode', GLib.VariantType.new('s'))
+        show.connect('activate', lambda _, mode: self.open_mode(mode.get_string()))
+        self.add_action(show)
+        self.start_mode = 'explorer'
+        self.init_explorer()
         self.connect('activate', self.activate)
         self.connect('shutdown', self.shutdown_pools)
 
     def shutdown_pools(self, *_):
-        for pool in (self.search_pool, self.preview_pool, self.thumb_pool): pool.shutdown(wait=False, cancel_futures=True)
+        for pool in (self.search_pool, self.preview_pool, self.thumb_pool, self.view_pool, self.prefetch_pool):
+            pool.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------ ventana
     def activate(self, *_):
@@ -364,6 +353,7 @@ class Cati(Gtk.Application):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.apply_theme()
         self.build()
+        self.set_mode(self.start_mode)
         self.search_pool.submit(self.load_searcher)
         GLib.timeout_add_seconds(2, self.poll)
         self.poll()
@@ -379,33 +369,62 @@ class Cati(Gtk.Application):
         if colors == getattr(self, 'colors', None): return
         self.colors = colors
         self.kind_colors = kind_color(colors)
-        if hasattr(self.provider, 'load_from_string'): self.provider.load_from_string(css(colors))
-        else: self.provider.load_from_data(css(colors).encode())
+        if hasattr(self.provider, 'load_from_string'): self.provider.load_from_string(css(colors) + explorer_css(colors))
+        else: self.provider.load_from_data((css(colors) + explorer_css(colors)).encode())
         self.scheme = source_scheme(colors)
 
     def load_searcher(self):
         try:
             self.searcher = searcher()
-            self.searcher.refresh()
-            GLib.idle_add(self.search_now if self.entry.get_text().strip() else self.show_recent)
+            self.searcher.refresh(vectors=False)
+            self.searcher.background_refresh = True
+            GLib.idle_add(self.search_now if self.entry.get_text().strip() else self.refresh_view)
             # Loading at login would hold the model in memory for nothing: warm it when the window opens.
             if self.window.get_visible(): self.searcher.warm()
-            else: self.searcher.refresh()
+            else: self.searcher.refresh(vectors=False)
         except Exception as exc:
             GLib.idle_add(self.problem, str(exc))
 
+    def open_mode(self, mode):
+        if not self.window:
+            self.start_mode = mode
+            self.activate()
+            return
+        if mode != self.mode:
+            # Las reglas de ventana se aplican al mostrarla: se oculta para que reaparezca con las del otro modo.
+            if self.window.get_visible(): self.hide()
+            self.set_mode(mode)
+        self.show()
+
     def show(self):
+        self.window_hidden_event.clear()
+        if 'idle-memory' in self.timers: GLib.source_remove(self.timers.pop('idle-memory'))
         self.apply_theme()
         self.window.present()
         if self.searcher: self.search_pool.submit(self.searcher.warm)
         self.entry.grab_focus()
         self.entry.select_region(0, -1)
-        if not self.entry.get_text().strip() and not self.query_image and self.searcher: self.show_recent()
+        if not self.entry.get_text().strip() and not self.query_image: self.refresh_view()
 
     def hide(self, *_):
         self.stop_media()
         self.window.set_visible(False)
+        self.window_hidden_event.set()
+        self.schedule('idle-memory', 60_000, self.release_idle_memory)
         return True
+
+    def release_idle_memory(self):
+        if not self.window_hidden_event.is_set(): return
+        self.preview_generation += 1  # pending previews and prefetches must not refill the caches
+        self.preview_cache.clear()
+        self.textures.clear()
+        # Keep navigation/selection and cheap query caches; release only the vector working set.
+        def work():
+            if not self.window_hidden_event.is_set(): return
+            if self.searcher: self.searcher.release_vectors()
+            self.preview_cache.clear()
+            give_back_memory()
+        self.search_pool.submit(work)
 
     def build(self):
         self.window = Gtk.ApplicationWindow(application=self, title='Cati')
@@ -431,8 +450,17 @@ class Cati(Gtk.Application):
         self.exact = button(EXACT, 'tool', lambda *_: self.search_now(), 'Solo palabras exactas (sin modelo)', toggle=True)
         bar.append(self.exact)
         bar.append(button(CAMERA, 'tool', self.choose_image, 'Buscar imágenes parecidas a una foto (o arrástrala aquí)'))
+        self.mode_button = button(EXPAND, 'tool', lambda *_: self.toggle_mode())
+        bar.append(self.mode_button)
         bar.append(button(COG, 'tool', self.settings, 'Carpetas y ajustes (Ctrl+,)'))
         root.append(bar)
+
+        body = Gtk.Box(vexpand=True)
+        root.append(body)
+        self.build_sidebar(body)
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        body.append(main)
+        self.build_refine(main)
 
         self.filters = Gtk.Box(css_classes=['filters'])
         self.chips = Gtk.Box()
@@ -441,7 +469,8 @@ class Cati(Gtk.Application):
         self.filters.append(self.tags)
         self.timing = label('', 'hint')
         self.filters.append(self.timing)
-        root.append(self.filters)
+        main.append(self.filters)
+        self.build_crumbs(main)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True, wide_handle=False)
         self.paned.set_position(520)
@@ -458,11 +487,12 @@ class Cati(Gtk.Application):
         scroll.set_child(self.results)
         self.result_scroll = scroll
         left.append(scroll)
+        self.build_batch(left)
         self.paned.set_start_child(left)
         self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=['preview'])
         self.preview_box.set_size_request(420, -1)
         self.paned.set_end_child(self.preview_box)
-        root.append(self.paned)
+        main.append(self.paned)
 
         footer = Gtk.Box(css_classes=['footer'])
         footer.append(label('cati', 'brand'))
@@ -470,7 +500,7 @@ class Cati(Gtk.Application):
         footer.append(self.dot)
         self.status = label('Cargando índice…', hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         footer.append(self.status)
-        for key, text in [('↑↓', 'navegar'), ('⏎', 'abrir'), ('Ctrl ⏎', 'carpeta'), ('Alt V', 'voz'), ('Tab', 'tipo'), ('Esc', 'cerrar')]:
+        for key, text in [('↑↓', 'navegar'), ('⏎', 'abrir'), ('Ctrl ⏎', 'mostrar'), ('Ctrl ␣', 'marcar'), ('Alt V', 'voz'), ('Tab', 'tipo'), ('Esc', 'cerrar')]:
             footer.append(label(key, 'kbd'))
             footer.append(label(text))
         root.append(footer)
@@ -482,6 +512,7 @@ class Cati(Gtk.Application):
         drop.connect('drop', self.dropped)
         self.window.add_controller(drop)
         self.empty_preview('Hola, soy Cati', 'Dime qué buscas con tus palabras: lo encuentro por nombre, por contenido o por lo que se ve, aunque no recuerdes cómo se llama.')
+        self.explorer_ready()
 
     # ----------------------------------------------------------- teclado
     def key(self, controller, key, code, state):
@@ -489,7 +520,8 @@ class Cati(Gtk.Application):
         shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
         alt = bool(state & Gdk.ModifierType.ALT_MASK)
         if key == Gdk.KEY_Escape:
-            if self.query_image: self.set_image(None)
+            if self.marked: self.clear_marks()
+            elif self.query_image: self.set_image(None)
             else: self.hide()
             return True
         if key in {Gdk.KEY_Down, Gdk.KEY_Up}:
@@ -509,12 +541,38 @@ class Cati(Gtk.Application):
             self.cycle_category(-1 if shift or key == Gdk.KEY_ISO_Left_Tab else 1)
             return True
         if ctrl and key in {Gdk.KEY_c, Gdk.KEY_C} and self.current and not self.entry.get_selection_bounds():
-            self.copy_path(self.current)
+            self.copy_paths(self.targets()) if self.marked else self.copy_path(self.current)
             return True
+        if (ctrl and key == Gdk.KEY_space) or key == Gdk.KEY_Insert:
+            if self.current:
+                self.toggle_mark(self.current)
+                self.move(1)
+            return True
+        if shift and key in {Gdk.KEY_Down, Gdk.KEY_Up} and self.current:
+            self.toggle_mark(self.current, True)
+            self.move(1 if key == Gdk.KEY_Down else -1)
+            self.toggle_mark(self.current, True)
+            return True
+        if ctrl and key in {Gdk.KEY_a, Gdk.KEY_A} and not self.entry.get_text():
+            self.mark_all(); return True
+        if ctrl and key in {Gdk.KEY_b, Gdk.KEY_B}:
+            self.toggle_sidebar(); return True
+        if ctrl and key in {Gdk.KEY_s, Gdk.KEY_S}:
+            self.save_search(); return True
+        if ctrl and key in {Gdk.KEY_e, Gdk.KEY_E} and self.current:
+            self.compress(); return True
+        if key == Gdk.KEY_BackSpace and not self.entry.get_text() and self.scope and not self.query_image:
+            self.parent(); return True
+        if alt and key == Gdk.KEY_Up:
+            self.parent(); return True
         if alt and key in {Gdk.KEY_v, Gdk.KEY_V}:
             self.voice(); return True
+        if key == Gdk.KEY_F11:
+            self.toggle_mode(); return True
         if key == Gdk.KEY_F2 and self.current:
             self.rename(); return True
+        if ctrl and shift and key in {Gdk.KEY_m, Gdk.KEY_M} and self.current:
+            self.copy_to(); return True
         if ctrl and key in {Gdk.KEY_m, Gdk.KEY_M} and self.current:
             self.move_to(); return True
         if ctrl and key == Gdk.KEY_Delete and self.current:
@@ -530,6 +588,9 @@ class Cati(Gtk.Application):
         if alt and key in {Gdk.KEY_Left, Gdk.KEY_Right} and getattr(self, 'pager', None):
             self.pager(-1 if key == Gdk.KEY_Left else 1)
             return True
+        if alt and key in {Gdk.KEY_Left, Gdk.KEY_Right}:
+            self.back() if key == Gdk.KEY_Left else self.forward()
+            return True
         if not self.entry.has_focus() and not ctrl and not alt:
             unicode = Gdk.keyval_to_unicode(key)
             if unicode and chr(unicode).isprintable():
@@ -542,12 +603,11 @@ class Cati(Gtk.Application):
 
     def move(self, step):
         self.user_moved = True
+        rows = self.real_rows()
+        if not rows: return
         row = self.results.get_selected_row()
-        index = (row.get_index() + step) if row else 0
-        total = 0
-        while self.results.get_row_at_index(total): total += 1
-        if not total: return
-        target = self.results.get_row_at_index(max(0, min(total - 1, index)))
+        index = (rows.index(row) + step) if row in rows else 0
+        target = rows[max(0, min(len(rows) - 1, index))]
         self.results.select_row(target)
         adjustment = self.result_scroll.get_vadjustment()
         ok, bounds = target.compute_bounds(self.results)
@@ -572,9 +632,13 @@ class Cati(Gtk.Application):
         self.user_moved = False
         self.literal = False  # a new phrase gets its typos corrected again
         text = self.entry.get_text().strip()
+        if text and self.view:   # escribir sale de «duplicados», «espacio»…: se busca (en la carpeta, si hay una)
+            self.view = None
+            self.marked.clear()
+            self.update_chrome()
         if not text and not self.query_image:
             for name in list(self.timers): GLib.source_remove(self.timers.pop(name))
-            self.show_recent()
+            self.refresh_view()
             return
         self.schedule('quick', 30, lambda: self.search_now(semantic=False))
         self.schedule('full', 240, self.search_now)
@@ -586,8 +650,9 @@ class Cati(Gtk.Application):
             self.generation += 1
         generation = self.generation
         query = self.entry.get_text().strip()
-        if not query and not self.query_image:
-            self.show_recent(); return
+        if not query and not self.query_image and not self.refine_active():
+            self.refresh_view(); return
+        filters = self.query_filters()
         exact = self.exact.get_active()
         semantic = semantic and not exact
         image_path = self.query_image
@@ -596,7 +661,7 @@ class Cati(Gtk.Application):
         def work():
             if generation != self.generation: return None
             return self.searcher.run(query, limit=150, lexical=exact, image_path=image_path, semantic=semantic,
-                                     exact=getattr(self, 'literal', False))
+                                     exact=getattr(self, 'literal', False), filters=filters)
 
         def done(future):
             try: results = future.result()
@@ -636,6 +701,7 @@ class Cati(Gtk.Application):
         if generation != self.generation: return False
         self.busy(False)
         self.results_intent = None
+        self.heading = None
         self.hits = hits
         self.category = 'all'
         self.clear(self.chips)
@@ -650,26 +716,13 @@ class Cati(Gtk.Application):
         if generation != self.generation: return False
         if final: self.busy(False)
         self.results_intent = results.intent
+        self.heading = None
         self.hits = results.hits
         self.filters.set_visible(True)
         counts = {}
         for hit in self.hits: counts[hit['kind']] = counts.get(hit['kind'], 0) + 1
         if self.category != 'all' and self.category not in counts: self.category = 'all'
-        self.clear(self.chips)
-        for key in ORDER:
-            amount = len(self.hits) if key == 'all' else counts.get(key)
-            if not amount: continue
-            content = Gtk.Box()
-            glyph = label(GLYPH[key])
-            glyph.set_margin_end(6)
-            content.append(glyph)
-            content.append(label(LABEL[key]))
-            content.append(label(str(amount), 'count'))
-            chip = button(content, 'chip', toggle=True)
-            chip.set_active(key == self.category)
-            chip.kind = key
-            chip.connect('toggled', self.chip_toggled)
-            self.chips.append(chip)
+        self.build_chips(self.hits)
         self.clear(self.tags)
         if results.intent.corrected:
             # «factra del dentsta» → results for «factura del dentista», one click away from the literal phrase.
@@ -711,10 +764,13 @@ class Cati(Gtk.Application):
     def apply_category(self):
         hits = self.hits if self.category == 'all' else [h for h in self.hits if h['kind'] == self.category]
         stems = [stem(t) for t in (self.results_intent.terms if self.results_intent else [])]
-        if not hits:
+        if self.heading and self.results_intent is None:
+            title = self.heading + ('' if self.category == 'all' else f' · {LABEL[self.category].upper()}')
+        elif not hits:
             title = 'SIN RESULTADOS' if not self.searching else 'BUSCANDO…'
         else:
             title = f"{len(hits)} RESULTADOS" + ('' if self.category == 'all' else f' EN {LABEL[self.category].upper()}')
+            if self.scope: title += f" · EN {(Path(self.scope).name or '/').upper()}"
         self.fill(hits, title, stems)
 
     def fill(self, hits, title, stems):
@@ -723,18 +779,20 @@ class Cati(Gtk.Application):
         self.section.set_text(title)
         self.clear(self.results)
         selected = None
-        for index, hit in enumerate(hits[:120]):
+        for index, hit in enumerate(hits[:360 if self.heading else 120]):
             row = self.row(hit, stems)
             self.results.append(row)
-            if hit['path'] == previous and selected is None: selected = row
+            if hit['path'] == previous and selected is None and 'header' not in hit: selected = row
         if not hits:
             self.current = None
-            if self.entry.get_text().strip() or self.query_image:
+            if self.heading is not None and self.results_intent is None:
+                self.empty_preview(*getattr(self, 'empty_note', ('Nada por aquí', 'No hay elementos.')))
+            elif self.entry.get_text().strip() or self.query_image:
                 if not self.searching:
                     self.empty_preview('Nada por aquí', 'Prueba con otras palabras, quita un filtro o espera a que termine el análisis: '
                                        'los nombres ya están todos, el contenido se completa en segundo plano.')
             return
-        target = selected or self.results.get_row_at_index(0)
+        target = selected or (self.real_rows() or [None])[0]
         self.results.select_row(target)
         if selected is None: self.result_scroll.get_vadjustment().set_value(0)
 
@@ -744,6 +802,7 @@ class Cati(Gtk.Application):
 
     # -------------------------------------------------------------- filas
     def row(self, hit, stems):
+        if 'header' in hit: return self.header_row(hit)
         row = Gtk.ListBoxRow()
         row.hit = hit
         layout = Gtk.Box(spacing=14)
@@ -760,7 +819,7 @@ class Cati(Gtk.Application):
         top.append(label(', '.join(hit['reasons']), 'why', ellipsize=Pango.EllipsizeMode.END, max_width_chars=16))
         text.append(top)
         meta = [f"<span foreground=\"{self.kind_colors[hit['kind']]}\">{SINGULAR[hit['kind']]}</span>"]
-        if hit['kind'] != 'folder' and hit['size']: meta.append(preview.human_size(hit['size']))
+        if hit['size'] and (hit['kind'] != 'folder' or 'bar' in hit): meta.append(preview.human_size(hit['size']))
         if hit['mtime']: meta.append(preview.human_time(hit['mtime'] / 1e9))
         if hit['loc'] is not None:
             if hit['kind'] == 'pdf': meta.append(f"página {int(hit['loc'])}")
@@ -773,18 +832,20 @@ class Cati(Gtk.Application):
             line.append(piece)
         line.append(label(short_path(Path(hit['path']).parent), 'meta', ellipsize=Pango.EllipsizeMode.START, hexpand=True))
         text.append(line)
+        if hit.get('bar') is not None:
+            text.append(Gtk.LevelBar(min_value=0, max_value=1, value=max(hit['bar'], .004), css_classes=['usage'], hexpand=True))
         if hit['excerpt']:
             snippet = label('', 'excerpt', ellipsize=Pango.EllipsizeMode.END, lines=2, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
             snippet.set_markup(excerpt_markup(hit['excerpt'], stems, self.colors['yellow']))
             text.append(snippet)
         layout.append(text)
+        self.decorate_row(row, layout, hit)
         row.set_child(layout)
         context = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
         context.connect('pressed', lambda *_: self.properties_for(row))
         row.add_controller(context)
         drag = Gtk.DragSource(actions=Gdk.DragAction.COPY)
-        drag.connect('prepare', lambda *_: Gdk.ContentProvider.new_for_value(
-            Gdk.FileList.new_from_array([Gio.File.new_for_path(hit['path'])])))
+        drag.connect('prepare', lambda *_: Gdk.ContentProvider.new_for_value(self.drag_files(hit)))
         row.add_controller(drag)
         return row
 
@@ -841,7 +902,10 @@ class Cati(Gtk.Application):
         if shown and shown['path'] == row.hit['path'] and shown['loc'] == row.hit['loc'] and (
                 getattr(self, 'shown_terms', None) == terms or row.hit['kind'] not in TEXT_PREVIEW | {'pdf'}):
             return
-        self.schedule('preview', 45, lambda: self.show_preview(row.hit))
+        # Al moverse de uno en uno se muestra al instante; si mantienes la flecha pulsada, solo donde te detienes.
+        now = time.monotonic()
+        rapid, self.last_selection = now - self.last_selection < .05, now
+        self.schedule('preview', 50 if rapid else 0, lambda: self.show_preview(row.hit))
 
     def stop_media(self):
         if self.media is not None:
@@ -891,31 +955,40 @@ class Cati(Gtk.Application):
         self.canvas.add_named(self.props_page, 'props')
         self.preview_box.append(self.canvas)
         actions = Gtk.Box(css_classes=['actions'])
-        primary = Gtk.Box()
-        primary.append(label(f'{OPEN}  Abrir'))
-        primary.append(label('⏎', 'key'))
-        actions.append(button(primary, 'action primary', lambda *_: self.open_hit(hit)))
-        second = Gtk.Box()
-        second.append(label(f'{FOLDER_OPEN}  Mostrar en carpeta'))
-        second.append(label('Ctrl ⏎', 'key'))
-        actions.append(button(second, 'action', lambda *_: self.open_hit(hit, folder=True)))
-        third = Gtk.Box()
-        third.append(label(f'{COPY}  Copiar ruta'))
-        third.append(label('Ctrl C', 'key'))
-        actions.append(button(third, 'action', lambda *_: self.copy_path(hit)))
-        info = Gtk.Box()
-        info.append(label(f'{INFO}  Propiedades'))
-        info.append(label('Alt ⏎', 'key'))
-        self.props_button = button(info, 'action', self.toggle_properties, toggle=True)
-        actions.append(self.props_button)
+        # Tres variantes de la misma barra: con atajos, sin atajos y solo iconos. Se ve la más completa
+        # que cabe, así la vista previa nunca obliga a la ventana a crecer.
         menu = Gio.Menu()
         menu.append('Renombrar (F2)', 'app.rename')
         menu.append('Mover a otra carpeta (Ctrl+M)', 'app.move')
+        menu.append('Copiar a otra carpeta (Ctrl+Mayús+M)', 'app.copy')
+        menu.append('Comprimir en ZIP (Ctrl+E)', 'app.zip')
         menu.append('Mover a la papelera (Ctrl+Supr)', 'app.trash')
-        more = Gtk.MenuButton(menu_model=menu, css_classes=['action'], tooltip_text='Más acciones')
-        more.set_child(label(MORE))
-        actions.append(more)
-        self.toolbar = Gtk.Box(hexpand=True, halign=Gtk.Align.END)
+        entries = [(OPEN, 'Abrir', '⏎', 'action primary', lambda *_: self.open_hit(hit)),
+                   (FOLDER_OPEN, 'Mostrar en carpeta', 'Ctrl ⏎', 'action', lambda *_: self.open_hit(hit, folder=True)),
+                   (COPY, 'Copiar ruta', 'Ctrl C', 'action', lambda *_: self.copy_path(hit)),
+                   (INFO, 'Propiedades', 'Alt ⏎', 'action', None)]
+        self.props_button = None
+        variants = []
+        for level in range(3):
+            row = Gtk.Box(halign=Gtk.Align.START)
+            for glyph, text, key, css_class, callback in entries:
+                content = Gtk.Box()
+                content.append(label(glyph if level == 2 and callback is not entries[0][4] else f'{glyph}  {text}'))
+                if level == 0: content.append(label(key, 'key'))
+                if callback:
+                    widget = button(content, css_class, callback, f'{text} ({key})')
+                elif self.props_button is None:
+                    widget = self.props_button = button(content, css_class, self.toggle_properties, f'{text} ({key})', toggle=True)
+                else:
+                    widget = button(content, css_class, tooltip=f'{text} ({key})', toggle=True)
+                    self.props_button.bind_property('active', widget, 'active', GObject.BindingFlags.BIDIRECTIONAL)
+                row.append(widget)
+            more = Gtk.MenuButton(menu_model=menu, css_classes=['action'], tooltip_text='Más acciones')
+            more.set_child(label(MORE))
+            row.append(more)
+            variants.append(row)
+        actions.append(Squeezer(variants, hexpand=True))
+        self.toolbar = Gtk.Box(halign=Gtk.Align.END, valign=Gtk.Align.START)
         actions.append(self.toolbar)
         self.preview_box.append(actions)
         if hit['copies']:
@@ -939,9 +1012,9 @@ class Cati(Gtk.Application):
         box.set_margin_start(40); box.set_margin_end(40)
         logo = PROJECT / 'assets/cati.svg'
         if logo.exists():
-            mark = Gtk.Picture.new_for_filename(str(logo))
-            mark.set_size_request(112, 112)
-            mark.set_can_shrink(False)
+            # Gtk.Image a tamaño fijo: un Gtk.Picture pediría el tamaño del SVG (512 px) y ensancharía la ventana.
+            mark = Gtk.Image.new_from_file(str(logo))
+            mark.set_pixel_size(112)
             mark.set_halign(Gtk.Align.CENTER)
             box.append(mark)
         else:
@@ -953,11 +1026,74 @@ class Cati(Gtk.Application):
     def background_job(self, work, apply):
         generation = self.preview_generation
 
+        def guarded():
+            # Si ya se ve otro archivo, no se hace: el trabajo viejo no retrasa al nuevo.
+            return _STALE if generation != self.preview_generation else work()
+
         def done(future):
             try: value = future.result()
             except Exception as exc: value = exc
-            GLib.idle_add(lambda: (apply(value) if generation == self.preview_generation else None, False)[1])
-        self.preview_pool.submit(work).add_done_callback(done)
+            if value is _STALE: return
+            GLib.idle_add(lambda: (apply(value) if generation == self.preview_generation else None, False)[1],
+                          priority=GLib.PRIORITY_HIGH_IDLE)
+        self.preview_pool.submit(guarded).add_done_callback(done)
+
+    def page_width(self):
+        """Ancho en píxeles reales al que conviene renderizar páginas: el del panel, redondeado."""
+        surface = self.window.get_surface()
+        scale = surface.get_scale() if surface is not None and hasattr(surface, 'get_scale') else self.window.get_scale_factor()
+        width = max(self.preview_box.get_width() - 60, 400) * max(scale, 1)
+        return int(min(2000, max(800, -(-width // 200) * 200)))
+
+    def cached_texture(self, kind, path, *parts):
+        return self.preview_cache.get(preview.Textures.key(path, kind, *parts))
+
+    def load_image(self, path):
+        key = preview.Textures.key(path, 'image')
+        value = self.preview_cache.get(key)
+        if value is None:
+            info, texture = preview.image_texture(path)
+            value = self.preview_cache.put(key, (info, texture), texture)
+        return value
+
+    def load_pdf_info(self, path):
+        key = preview.Textures.key(path, 'pdf-info')
+        value = self.preview_cache.get(key)
+        return value if value is not None else self.preview_cache.put(key, preview.pdf_info(path), None)
+
+    def load_pdf_page(self, path, page, width):
+        key = preview.Textures.key(path, 'pdf-page', page, width)
+        texture = self.preview_cache.get(key)
+        if texture is None:
+            texture = preview.pdf_texture(path, page, width)
+            self.preview_cache.put(key, texture, texture)
+        return texture
+
+    def prefetch_neighbours(self, hit):
+        """Prepara en segundo plano la vista del anterior y el siguiente: al bajar con las flechas ya está lista."""
+        rows = self.real_rows()
+        current = next((i for i, row in enumerate(rows) if row.hit is hit), None)
+        if current is None: return
+        width = self.page_width()
+        generation = self.preview_generation
+        nearest = rows[current + 1].hit['path'] if current + 1 < len(rows) else None
+        for row in (rows[i] for i in (current + 1, current - 1, current + 2) if 0 <= i < len(rows)):
+            target, kind = row.hit['path'], row.hit['kind']
+            ext = Path(target).suffix.lower()
+
+            def work(target=target, kind=kind, ext=ext, page=int(row.hit.get('loc') or 1)):
+                if generation != self.preview_generation: return
+                try:
+                    if kind == 'image' and ext not in RAW_IMAGES: self.load_image(target)
+                    elif kind == 'pdf':
+                        pages, _ = self.load_pdf_info(target)
+                        self.load_pdf_page(target, max(1, min(pages, page)), width)
+                    elif ext in {'.html', '.htm'}:
+                        if target == nearest: self.load_html(target)   # Chromium: solo el siguiente
+                    elif kind in TEXT_PREVIEW or ext in preview.OFFICE: self.load_text(target)
+                except Exception:
+                    pass
+            self.prefetch_pool.submit(work)
 
     def placeholder(self, body, text='Preparando vista previa…'):
         wait = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, vexpand=True, valign=Gtk.Align.CENTER)
@@ -979,6 +1115,7 @@ class Cati(Gtk.Application):
             self.props_button.set_active(True)  # shows the properties; the preview loads only if asked for
         else:
             self.run_preview()
+        GLib.timeout_add(120, lambda: (self.prefetch_neighbours(hit) if self.shown is hit else None, False)[1])
 
     def run_preview(self):
         build, self.pending_preview = getattr(self, 'pending_preview', None), None
@@ -1105,7 +1242,7 @@ class Cati(Gtk.Application):
         ext = Path(hit['path']).suffix.lower()
         try:
             if kind == 'folder': self.preview_folder(body, hit)
-            elif kind == 'image' and ext not in {'.psd', '.xcf', '.raw', '.cr2', '.nef', '.dng', '.kra'}: self.preview_image(body, hit)
+            elif kind == 'image' and ext not in RAW_IMAGES: self.preview_image(body, hit)
             elif kind == 'pdf': self.preview_pdf(body, hit)
             elif ext in preview.OFFICE: self.preview_office(body, hit)
             elif kind in {'video', 'audio'} or ext in MEDIA_EXTS: self.preview_media(body, hit)
@@ -1117,24 +1254,12 @@ class Cati(Gtk.Application):
             self.clear(body)
             body.append(label(f'No se pudo mostrar: {exc}', 'empty', xalign=.5, vexpand=True))
 
-    def scrolled_picture(self, body, path):
-        scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroll.set_child(Page(Gdk.Texture.new_from_filename(str(path))))
-        body.append(scroll)
-        return scroll
-
     def preview_image(self, body, hit):
-        wait = self.placeholder(body)
-
-        def work():
-            info = preview.image_info(hit['path'])
-            from gi.repository import GdkPixbuf
-            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(hit['path'], 2000, 2000, True)
-            pixbuf = pixbuf.apply_embedded_orientation() or pixbuf
-            return info, Gdk.Texture.new_for_pixbuf(pixbuf)
+        ready = self.cached_texture('image', hit['path'])
+        wait = None if ready else self.placeholder(body)
 
         def apply(value):
-            body.remove(wait)
+            if wait is not None: body.remove(wait)
             if isinstance(value, Exception):
                 body.append(label(f'No se pudo abrir la imagen: {value}', 'empty', xalign=.5, vexpand=True)); return
             info, texture = value
@@ -1142,7 +1267,8 @@ class Cati(Gtk.Application):
             picture = Gtk.Picture(paintable=texture, content_fit=Gtk.ContentFit.CONTAIN, vexpand=True, can_shrink=True)
             picture.set_margin_top(10); picture.set_margin_bottom(10); picture.set_margin_start(10); picture.set_margin_end(10)
             body.append(picture)
-        self.background_job(work, apply)
+        if ready: apply(ready)
+        else: self.background_job(lambda: self.load_image(hit['path']), apply)
 
     def preview_pdf(self, body, hit, source=None, first=None):
         """Todas las páginas seguidas: la rueda del ratón recorre el documento y cada página se dibuja
@@ -1153,9 +1279,11 @@ class Cati(Gtk.Application):
         following = button(RIGHT, 'switch', lambda *_: turn(1), 'Página siguiente (Alt →)')
         for widget in (previous, counter, following): self.toolbar.append(widget)
         counter.set_margin_start(8); counter.set_margin_end(2)
-        wait = self.placeholder(body, 'Abriendo el documento…')
+        info = self.cached_texture('pdf-info', path)
+        wait = None if info else self.placeholder(body, 'Abriendo el documento…')
         state = {'pages': 0, 'page': int(first or hit.get('loc') or 1)}
-        textures, loading = OrderedDict(), set()
+        loading = set()
+        width = self.page_width()
 
         def turn(step):
             if state['pages']: show(max(1, min(state['pages'], state['page'] + step)))
@@ -1167,24 +1295,45 @@ class Cati(Gtk.Application):
 
             def work():
                 if widget.page != page: return None  # scrolled past before its turn came
-                return Gdk.Texture.new_from_filename(str(preview.pdf_page(path, page)))
+                return self.load_pdf_page(path, page, width)
 
             def apply(value):
                 loading.discard(page)
                 if value is None or isinstance(value, Exception): return
-                textures[page] = value
-                while len(textures) > 24: textures.popitem(last=False)
-                if widget.page == page: widget.set_texture(value)
+                if widget.page == page:
+                    widget.set_texture(value)
+                    self.schedule('pdf-pages', 40, pump)  # its real height may bring the next page into view
             self.background_job(work, apply)
+
+        bound = set()
+
+        def near(widget, scroll):
+            """¿Está la página en pantalla o a menos de una pantalla? La lista enlaza muchas más de las que se ven."""
+            ok, rect = widget.compute_bounds(scroll)
+            if not ok: return False
+            height = max(scroll.get_height(), 800)  # a short panel still prepares the next page
+            return rect.origin.y < 2 * height and rect.origin.y + rect.size.height > -height
+
+        def pump():
+            scroll = getattr(self, 'pdf_scroll', None)
+            if scroll is None or not scroll.get_mapped(): return False
+            for widget in sorted(bound, key=lambda w: w.page):
+                if widget.texture is None and widget.get_mapped() and near(widget, scroll): request(widget.page, widget)
+            return False
 
         def bind(_, item):
             widget = item.get_child()
             widget.page = int(item.get_item().get_string())
-            widget.set_texture(textures.get(widget.page))
-            if widget.page not in textures: request(widget.page, widget)
+            texture = self.cached_texture('pdf-page', path, widget.page, width)
+            widget.set_texture(texture)
+            bound.add(widget)
+            if texture is None: self.schedule('pdf-pages', 40, pump)
+
+        def unbind(_, item):
+            bound.discard(item.get_child())
 
         def apply(value):
-            body.remove(wait)
+            if wait is not None: body.remove(wait)
             if isinstance(value, Exception):
                 body.append(label(f'No se pudo abrir: {value}', 'empty', xalign=.5, vexpand=True)); return
             pages, ratio = value
@@ -1193,6 +1342,7 @@ class Cati(Gtk.Application):
             factory = Gtk.SignalListItemFactory()
             factory.connect('setup', lambda _, item: item.set_child(SheetPage(ratio)))
             factory.connect('bind', bind)
+            factory.connect('unbind', unbind)
             model = Gtk.NoSelection(model=Gtk.StringList.new([str(n) for n in range(1, pages + 1)]))
             view = Gtk.ListView(model=model, factory=factory, css_classes=['pages'])
             scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER, child=view)
@@ -1205,6 +1355,8 @@ class Cati(Gtk.Application):
                 state['page'] = max(1, min(pages, int((adjustment.get_value() + adjustment.get_page_size() / 3) / max(span, 1)) + 1))
                 counter.set_text(f"{state['page']} / {pages}")
             adjustment.connect('value-changed', follow)
+            adjustment.connect('value-changed', lambda *_: self.schedule('pdf-pages', 40, pump))
+            self.pdf_scroll = scroll
             counter.set_text(f"{state['page']} / {pages}")
             self.pdf_view = view
             if state['page'] > 1: GLib.idle_add(lambda: (view.scroll_to(state['page'] - 1, Gtk.ListScrollFlags.NONE, None), False)[1])
@@ -1213,8 +1365,9 @@ class Cati(Gtk.Application):
             state['page'] = page
             view = getattr(self, 'pdf_view', None)
             if view is not None: view.scroll_to(page - 1, Gtk.ListScrollFlags.NONE, None)
-        self.pdf_view = None
-        self.background_job(lambda: (preview.pdf_pages(path), preview.pdf_size(path)), apply)
+        self.pdf_view = self.pdf_scroll = None
+        if info: apply(info)
+        else: self.background_job(lambda: self.load_pdf_info(path), apply)
 
     def preview_office(self, body, hit):
         """Con LibreOffice, el documento tal cual se imprimiría; sin él, su texto."""
@@ -1239,25 +1392,46 @@ class Cati(Gtk.Application):
         code = button('Código', 'switch', toggle=True)
         code.set_group(view)
         view.set_active(True)
-        view.connect('toggled', lambda b: stack.set_visible_child_name('view' if b.get_active() else 'code'))
+        built = []
+
+        def switch(button):
+            if not button.get_active() and not built:   # el código se prepara solo si se pide
+                built.append(True)
+                self.preview_text(source, hit, language='html')
+            stack.set_visible_child_name('view' if button.get_active() else 'code')
+        view.connect('toggled', switch)
         self.toolbar.append(view); self.toolbar.append(code)
-        self.preview_text(source, hit, language='html')
-        wait = self.placeholder(rendered, 'Renderizando la página (sin conexión a internet)…')
+        wait = None if self.cached_texture('html', hit['path']) else self.placeholder(rendered, 'Renderizando la página (sin conexión a internet)…')
 
         def apply(value):
-            rendered.remove(wait)
+            if wait is not None: rendered.remove(wait)
             if isinstance(value, Exception) or value is None:
                 rendered.append(label('No se pudo renderizar; mira el código.', 'empty', xalign=.5, vexpand=True))
                 code.set_active(True); return
-            self.scrolled_picture(rendered, value)
-        self.background_job(lambda: preview.html_render(hit['path']), apply)
+            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            scroll.set_child(Page(value))
+            rendered.append(scroll)
+
+        ready = self.cached_texture('html', hit['path'])
+        if ready: apply(ready)
+        else: self.background_job(lambda: self.load_html(hit['path']), apply)
+
+    def load_html(self, path):
+        key = preview.Textures.key(path, 'html')
+        texture = self.preview_cache.get(key)
+        if texture is None:
+            shot = preview.html_render(path)
+            if shot is None: return None
+            texture = Gdk.Texture.new_from_filename(str(shot))
+            self.preview_cache.put(key, texture, texture)
+        return texture
 
     def preview_text(self, body, hit, language=None):
-        wait = self.placeholder(body)
+        wait = None if self.cached_texture('text', hit['path']) else self.placeholder(body)
         stems = [stem(t) for t in (self.results_intent.terms if self.results_intent else [])]
 
         def apply(value):
-            body.remove(wait)
+            if wait is not None: body.remove(wait)
             if isinstance(value, Exception):
                 self.preview_other(body, hit); return
             text, truncated = value
@@ -1292,7 +1466,17 @@ class Cati(Gtk.Application):
                     if found: view.scroll_to_iter(place, 0.0, True, 0.0, 0.25)
                     return False
                 GLib.timeout_add(60, scroll_to)
-        self.background_job(lambda: preview.read_text(hit['path']), apply)
+        ready = self.cached_texture('text', hit['path'])
+        if ready: apply(ready)
+        else: self.background_job(lambda: self.load_text(hit['path']), apply)
+
+    def load_text(self, path):
+        key = preview.Textures.key(path, 'text')
+        value = self.preview_cache.get(key)
+        if value is None:
+            value = preview.read_text(path)
+            self.preview_cache.put(key, value, cost=len(value[0]) * 2 + 1024)
+        return value
 
     def preview_media(self, body, hit):
         media = Gtk.MediaFile.new_for_filename(hit['path'])
@@ -1402,8 +1586,14 @@ class Cati(Gtk.Application):
 
     # ------------------------------------------------------------ acciones
     def open_hit(self, hit, folder=False):
+        if 'header' in hit: return
+        if hit['kind'] == 'folder' and not folder and Path(hit['path']).is_dir():
+            # Una carpeta se entra dentro de Cati; Ctrl+Intro la muestra en el gestor de archivos.
+            self.navigate(hit['path'], 'space' if self.view == 'space' else None)
+            return
         try:
             open_path(hit['path'], hit['kind'], hit['loc'], folder)
+            if not folder: self.view_pool.submit(usage.record, hit['path'])
             self.hide()
         except Exception as exc:
             self.empty_preview('No se pudo abrir', str(exc))
@@ -1516,7 +1706,8 @@ class Cati(Gtk.Application):
             self.listening.set()  # second press: stop and transcribe what was said
             return
         from . import voice as speech
-        self.show()
+        if self.window.get_visible(): self.show()
+        else: self.open_mode('search')   # Super+Alt+V con Cati oculto: la ventana de búsqueda, no el explorador
         self.listening = stop = threading.Event()
         self.mic.add_css_class('listening')
         if self.entry.get_text(): self.entry.set_text('')
@@ -1597,95 +1788,6 @@ class Cati(Gtk.Application):
         row = rows[number - 1] if 0 < number <= len(rows) else rows[-1] if number == -1 else None
         if row: self.results.select_row(row)
         return row.hit if row else None
-
-    # ---------------------------------------------------------- archivos
-    def rename(self):
-        hit = self.current
-        if not hit: return
-        path = Path(hit['path'])
-        dialog = Gtk.Window(title='Renombrar', transient_for=self.window, modal=True, decorated=False)
-        dialog.add_css_class('cati-dialog')
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=['panel'])
-        box.append(label(f'{RENAME}  Renombrar', 'heading'))
-        entry = Gtk.Entry(text=path.name, width_chars=48)
-        box.append(entry)
-        problem = label('', 'problem', wrap=True)
-        box.append(problem)
-        dialog.set_child(box)
-
-        def apply(*_):
-            name = entry.get_text().strip()
-            if not name or '/' in name: problem.set_text('Escribe un nombre sin «/».'); return
-            target = path.with_name(name)
-            if target.exists(): problem.set_text('Ya existe un archivo con ese nombre.'); return
-            try: path.rename(target)
-            except OSError as exc: problem.set_text(str(exc)); return
-            dialog.destroy()
-            self.after_change(f'Renombrado a {name}', lambda: target.rename(path))
-        entry.connect('activate', apply)
-        keys = Gtk.EventControllerKey()
-        keys.connect('key-pressed', lambda c, k, *_: (dialog.destroy(), True)[1] if k == Gdk.KEY_Escape else False)
-        dialog.add_controller(keys)
-        dialog.present()
-        stem = len(path.stem) if path.suffix and not path.is_dir() else len(path.name)
-        entry.grab_focus(); entry.select_region(0, stem)
-
-    def move_to(self):
-        hit = self.current
-        if not hit: return
-        path = Path(hit['path'])
-        chooser = Gtk.FileDialog(title=f'Mover «{path.name}» a…', accept_label='Mover aquí')
-        chooser.set_initial_folder(Gio.File.new_for_path(str(path.parent)))
-
-        def finished(chooser, result):
-            try: folder = chooser.select_folder_finish(result)
-            except GLib.Error: return
-            target = Path(folder.get_path()) / path.name
-            if target.exists(): self.timing.set_text('Ya existe un archivo con ese nombre allí'); return
-            import shutil
-            try: shutil.move(str(path), str(target))
-            except OSError as exc: self.timing.set_text(str(exc)); return
-            self.after_change(f'Movido a {short_path(target.parent)}', lambda: shutil.move(str(target), str(path)))
-        chooser.select_folder(self.window, None, finished)
-
-    def trash(self):
-        hit = self.current
-        if not hit: return
-        path = Path(hit['path'])
-        try: Gio.File.new_for_path(str(path)).trash(None)
-        except GLib.Error as exc:
-            self.timing.set_text(f'No se pudo mover a la papelera: {exc.message}'); return
-        self.after_change(f'«{path.name}» está en la papelera', lambda: restore(path))
-
-    def after_change(self, message, undo):
-        """Refresca los resultados y ofrece deshacer durante diez segundos."""
-        self.undo = (message, undo)
-        self.filters.set_visible(True)
-        self.timing.set_text(message)
-        self.clear(self.tags)
-        self.tags.append(button(f'{UNDO}  Deshacer (Ctrl+Z)', 'undo', lambda *_: self.undo_action()))
-        GLib.timeout_add_seconds(10, self.expire_undo, self.undo)
-        self.shown = None
-        GLib.timeout_add(400, lambda: (self.search_now() if self.entry.get_text().strip() else self.show_recent(), False)[1])
-
-    def expire_undo(self, token):
-        if self.undo is token:
-            self.undo = None
-            self.clear(self.tags)
-            if not self.entry.get_text().strip(): self.filters.set_visible(False)
-        return False
-
-    def undo_action(self):
-        if not self.undo: return
-        message, undo = self.undo
-        self.undo = None
-        self.clear(self.tags)
-        try:
-            undo()
-            self.timing.set_text('Deshecho')
-        except Exception as exc:
-            self.timing.set_text(f'No se pudo deshacer: {exc}')
-        GLib.timeout_add(400, lambda: (self.search_now() if self.entry.get_text().strip() else self.show_recent(), False)[1])
 
     # ------------------------------------------------------------- ajustes
     def settings(self, *_):
@@ -1845,31 +1947,28 @@ class _Done:
         return self.value
 
 
-def restore(original):
-    """Devuelve a su sitio el último elemento enviado a la papelera desde esa ruta."""
-    from urllib.parse import unquote
-    trash = Path(GLib.get_user_data_dir()) / 'Trash'
-    candidates = []
-    for info in (trash / 'info').glob('*.trashinfo'):
-        text = info.read_text(errors='replace')
-        match = re.search(r'^Path=(.+)$', text, re.M)
-        if match and unquote(match[1]) == str(original):
-            candidates.append((info.stat().st_mtime, info))
-    if not candidates: raise RuntimeError('ya no está en la papelera')
-    info = max(candidates)[1]
-    stored = trash / 'files' / info.name.removesuffix('.trashinfo')
-    if original.exists(): raise RuntimeError('ya existe otro archivo con ese nombre')
-    stored.rename(original)
-    info.unlink()
+def tune_allocator():
+    """Las vistas previas decodifican imágenes y páginas de decenas de MB en varios hilos: con dos montículos
+    y los bloques grandes en mmap (que vuelven al sistema al liberarse) no queda memoria fragmentada.
+    Medido: pico de 596 a 473 MB tras cinco búsquedas con vista previa."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None)
+        libc.mallopt(-8, 2)          # M_ARENA_MAX
+        libc.mallopt(-3, 256 * 1024)  # M_MMAP_THRESHOLD
+    except (AttributeError, OSError): pass
 
 
-def run(background=False, voice=False):
+def run(background=False, voice=False, mode='explorer'):
+    tune_allocator()
     app = Cati(background)
-    if voice:
-        # Already running: ask the resident instance to listen and return at once.
-        app.register(None)
-        if app.get_is_remote():
-            app.activate_action('voice', None)
-            return
-        app.voice_on_start = True
+    if voice: mode = 'search'
+    app.start_mode = mode
+    # Already running: hand the request to the resident instance and return at once.
+    app.register(None)
+    if app.get_is_remote():
+        if voice: app.activate_action('voice', None)
+        elif not background: app.activate_action('show-mode', GLib.Variant('s', mode))
+        return
+    app.voice_on_start = voice
     app.run(None)

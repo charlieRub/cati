@@ -53,7 +53,15 @@ class Engine:
     def encode(self, inputs):
         if self.background:
             yield_to_search()
-            with Engine.background_slot: return self._encode(inputs)
+            with Engine.background_slot:
+                began = time.monotonic()
+                result = self._encode(inputs)
+                # Pace background GPU work, while interactive searches retain
+                # their own server slot and do not wait for this cooldown.
+                elapsed = time.monotonic() - began
+                duty = max(.05,min(1,float(self.config.get('background_duty',.25))))
+                if duty < 1: time.sleep(min(10,elapsed*(1-duty)/duty))
+                return result
         mark_search()
         return self._encode(inputs)
 

@@ -203,7 +203,8 @@ def fonts():
 
 def has_systemd():
     if not shutil.which('systemctl'): return False
-    state = subprocess.run(['systemctl', '--user', 'is-system-running'], capture_output=True, text=True).stdout.strip()
+    try: state = subprocess.run(['systemctl', '--user', 'is-system-running'], capture_output=True, text=True, timeout=5).stdout.strip()
+    except subprocess.SubprocessError: return False
     return state not in {'', 'offline'}
 
 
@@ -244,8 +245,11 @@ RestartSec=5
 Environment=MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=131072
 Nice=19
 CPUWeight=idle
+CPUQuota=35%
 IOSchedulingClass=idle
-MemoryHigh=700M
+MemoryHigh=1G
+MemoryMax=2G
+MemorySwapMax=256M
 UMask=0077
 NoNewPrivileges=true
 TimeoutStopSec=60
@@ -291,7 +295,8 @@ def uninstall(args):
         subprocess.run(['systemctl', '--user', 'daemon-reload'], capture_output=True)
     from cati.service import stop
     for name in ('watch', 'engine'): stop(name)
-    subprocess.run(['pkill', '-f', 'python -m cati gui'], capture_output=True)
+    # Every resident window: «gui --background» as well as explorer, quick search and voice.
+    subprocess.run(['pkill', '-f', r'python[0-9.]* -m cati (gui|explorer|quick|voice)'], capture_output=True)
     AUTOSTART.with_name('dev.cati.Cati-watch.desktop').unlink(missing_ok=True)
     remove()
     if args.purge:
@@ -308,7 +313,7 @@ def main():
     parser = argparse.ArgumentParser(prog='install.sh', description='Instala Cati para el usuario actual.')
     parser.add_argument('--deps', action='store_true', help='instala con sudo los paquetes del sistema que falten')
     parser.add_argument('--gpu', choices=['auto', 'vulkan', 'cpu'], default='auto', help='aceleración del motor (por defecto: auto)')
-    parser.add_argument('--shortcut', help='atajo, p. ej. "SUPER ALT, U" (Hyprland) o "<Super><Alt>u" (GNOME)')
+    parser.add_argument('--shortcut', help='atajo del explorador, p. ej. "SUPER ALT, E" (Hyprland) o "<Super><Alt>e" (GNOME)')
     parser.add_argument('--no-shortcut', action='store_true', help='no configurar atajo de teclado')
     parser.add_argument('--no-voice', action='store_true', help='no instalar la búsqueda por voz')
     parser.add_argument('--uninstall', action='store_true', help='retira Cati del sistema')

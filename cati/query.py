@@ -8,8 +8,23 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
+class _Marks(dict):
+    """Tabla para str.translate que borra las marcas combinantes; aprende cada carácter la primera vez."""
+    def __missing__(self, code):
+        value = None if unicodedata.combining(chr(code)) else code
+        self[code] = value
+        return value
+
+
+_MARKS = _Marks()
+
+
 def normalize(text):
-    return ''.join(c for c in unicodedata.normalize('NFKD', text.casefold()) if not unicodedata.combining(c))
+    # Hot path of every search (names of thousands of candidates): ASCII needs no decomposition,
+    # and translate drops accents ~15x faster than filtering character by character.
+    text = text.casefold()
+    if text.isascii(): return text
+    return unicodedata.normalize('NFKD', text).translate(_MARKS)
 
 
 # «que creé» / «que modifiqué»: which date the phrase talks about. Default: either of them.
@@ -87,6 +102,7 @@ NUMBERS = {'un': 1, 'una': 1, 'uno': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco
 UNITS = {'dia': 1, 'dias': 1, 'day': 1, 'days': 1, 'semana': 7, 'semanas': 7, 'week': 7, 'weeks': 7,
          'mes': 30, 'meses': 30, 'month': 30, 'months': 30, 'ano': 365, 'anos': 365, 'year': 365, 'years': 365}
 SIZE = {'kb': 1024, 'mb': 1024 ** 2, 'gb': 1024 ** 3}
+BIGGEST = float(1 << 62)  # bytes; below SQLite's 64-bit limit and exact as a float
 LABEL = {'folder': 'Carpetas', 'document': 'Documentos', 'pdf': 'PDF', 'image': 'Imágenes', 'video': 'Vídeo',
          'audio': 'Audio', 'sheet': 'Hojas de cálculo', 'slides': 'Presentaciones', 'code': 'Código', 'archive': 'Comprimidos'}
 
@@ -403,14 +419,15 @@ def parse(query, now=None):
     cut(r'\b(?:a|sobre)\s+las?\s+(\d{1,2})(?:[:.h](\d\d))?\s*(?:h|horas)?\b|\bpor\s+la\s+(manana|tarde|noche)\b', hour)
 
     def size(match, attr):
-        value = float(match.group(1).replace(',', '.')) * SIZE[match.group(2)]
+        # «más de 99999999999999999999 GB» must not overflow SQLite's 64-bit integers (or float to inf).
+        value = min(float(match.group(1).replace(',', '.')) * SIZE[match.group(2)], BIGGEST)
         setattr(intent, attr, int(value))
         intent.labels.append(('>' if attr == 'min_size' else '<') + f' {match.group(1)} {match.group(2).upper()}')
     cut(r'\b(?:de )?(?:mas de|mayores? (?:de|que)|over|larger than|bigger than)\s+(\d+(?:[.,]\d+)?)\s*(kb|mb|gb)\b', lambda m: size(m, 'min_size'))
     cut(r'\b(?:de )?(?:menos de|menores? (?:de|que)|under|smaller than)\s+(\d+(?:[.,]\d+)?)\s*(kb|mb|gb)\b', lambda m: size(m, 'max_size'))
 
     def about(match):
-        value = float(match.group(1).replace(',', '.')) * SIZE[match.group(2)]
+        value = min(float(match.group(1).replace(',', '.')) * SIZE[match.group(2)], BIGGEST / 1.3)
         intent.min_size, intent.max_size = int(value * .75), int(value * 1.3)
         intent.labels.append(f'≈ {match.group(1)} {match.group(2).upper()}')
     cut(r'\b(?:de\s+)?(?:unos?\s+|aprox(?:imadamente)?\s+|about\s+|around\s+|~\s*)?(\d+(?:[.,]\d+)?)\s*(kb|mb|gb)\b', about)

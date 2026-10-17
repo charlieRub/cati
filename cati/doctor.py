@@ -119,3 +119,34 @@ def report(optional=True):
             command = install_command(names)
             print(f'\n{label}:\n  {command}' if command else f'\n{label}: ' + ', '.join(REQUIREMENTS[n][0] for n in names))
     return missing
+
+
+def inotify_limit():
+    try: return int(Path('/proc/sys/fs/inotify/max_user_watches').read_text())
+    except (OSError, ValueError): return None
+
+
+def service_report():
+    """Estado de la vigilancia en segundo plano y del límite de inotify que necesita."""
+    import json
+    import time
+    from .config import DATA
+    print('\nVigilancia de archivos:')
+    try: state = json.loads((DATA / 'status.json').read_text())
+    except (OSError, ValueError): state = None
+    age = time.time() - state.get('updated', 0) if state else None
+    if not state or state.get('mode') != 'watch':
+        print('  - Sin datos del servicio (aún no ha arrancado; «systemctl --user status cati-index»)')
+    elif not state.get('running') or age > 30:
+        print(f'  ✗ Parado: última noticia hace {int(age)} s (systemctl --user status cati-index)')
+    else:
+        print(f"  ✓ En marcha ({state.get('phase')}): {state.get('catalog', 0)} nombres, {state.get('queued', 0)} pendientes")
+        if state.get('error'): print(f"  ! Último error: {state['error']}")
+    limit = inotify_limit()
+    if state and limit:
+        used = state.get('watches', 0) + state.get('watch_fallback', 0)
+        if state.get('watch_fallback') or used > limit * .8:
+            print(f'  ✗ Límite de inotify casi agotado ({used} de {limit} carpetas); amplíalo con:\n'
+                  f'    echo fs.inotify.max_user_watches=524288 | sudo tee /etc/sysctl.d/90-cati.conf && sudo sysctl --system')
+        else:
+            print(f'  ✓ inotify: {state.get("watches", 0)} carpetas vigiladas (límite {limit})')

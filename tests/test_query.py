@@ -190,6 +190,18 @@ class Spelling(unittest.TestCase):
         self.assertEqual(self.fix('informe.pfd'), 'informe.pfd')            # extensions and paths
         self.assertEqual(self.fix('"factra" del dentsta'), '"factra" del dentista')  # quoted text is literal
 
+    def test_rest_of_the_phrase_breaks_a_tie(self):
+        lexicon = spelling.Lexicon.create({'test': 9, 'stubs': 3, 'module': 2, 'mode': 40}, {}, {'es': {}, 'en': {'mode': 9000, 'module': 900}}, {})
+        # A common word can outrank a closer one; the file names that hold the other words decide.
+        common = spelling.Lexicon.create({'test': 9, 'stubs': 3, 'module': 1, 'mode': 400}, {},
+                                         {'es': {}, 'en': {'mode': 900000, 'module': 2}}, {})
+        self.assertEqual(common.correct('test modue stubs')[0], 'test mode stubs')
+        named = lambda word, others: word == 'module' and {'test', 'stubs'} <= set(others)  # «test_no_module_stubs.py»
+        self.assertEqual(common.correct('test modue stubs', named)[0], 'test module stubs')
+        # Context never pulls in a spelling farther away than the preferred one.
+        farther = lambda word, others: word == 'mode'
+        self.assertEqual(lexicon.correct('test modue stubs', farther)[0], lexicon.correct('test modue stubs')[0])
+
     def test_far_keys_are_not_typos(self):
         self.assertGreater(spelling.distance('nefrologia', 'neurologia', 3), 1.6)
         self.assertLessEqual(spelling.distance('lactnte', 'lactante', 3), .8)

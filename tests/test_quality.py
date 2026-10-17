@@ -13,7 +13,7 @@ from cati.config import DEFAULTS
 from cati.engine import Engine
 from cati.indexer import index
 from cati.readers import image
-from cati.search import search
+from cati.search import forget, search
 from cati.store import connect, opened
 from cati.watch import Watcher
 from test_integration import pdf
@@ -39,7 +39,7 @@ class Quality(unittest.TestCase):
         assert result['errors']==0,result
 
     @classmethod
-    def tearDownClass(cls):cls.temp.cleanup()
+    def tearDownClass(cls):forget(cls.db);cls.temp.cleanup()
 
     def test_visual_spanish_without_filename_clues(self):
         for query in ['foto de una pirámide','una foto de las pirámides de Egipto','quiero una imagen de las piramides','photo of pyramids in Egypt']:
@@ -137,7 +137,7 @@ class Quality(unittest.TestCase):
                 moved.unlink()
                 wait_for(lambda:not finds('LIVEMODIFY88531'))
             finally:
-                watcher.stop.set();watcher.rescan.set();thread.join(timeout=15)
+                watcher.stop.set();watcher.rescan.set();thread.join(timeout=15);forget(db)
                 self.assertFalse(thread.is_alive())
 
 

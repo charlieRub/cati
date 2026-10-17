@@ -10,7 +10,7 @@ from pathlib import Path
 from .config import DATA, load
 from .engine import Engine, EngineError
 from .readers import walk, extract, cache_thumbnail
-from .store import connect
+from .store import connect, next_segment_id
 
 
 def reader_options(config, kind=None):
@@ -32,6 +32,12 @@ def fingerprint(path, size):
     return digest.hexdigest()
 
 
+def error_options(options, stat):
+    """Negative cache invalidates on content/permission changes or reader options.
+    Its version can be bumped without invalidating successfully indexed files."""
+    return f'{options}:failed-v1:{stat.st_ctime_ns}'
+
+
 def reuse(db, path, stat, kind, options, print_):
     """Copia el análisis de un archivo idéntico ya completado; devuelve True si lo hizo."""
     twin = db.execute('''SELECT id,cursor FROM files WHERE fingerprint=? AND size=? AND kind=? AND options=?
@@ -47,8 +53,8 @@ def reuse(db, path, stat, kind, options, print_):
         db.execute('DELETE FROM segments WHERE file=?', (file_id,))
         for text, segment_kind, loc, end, vec, sets_scale in db.execute(
                 'SELECT text,kind,loc,end,vec,sets_scale FROM segments WHERE file=? ORDER BY id', (twin['id'],)).fetchall():
-            row = db.execute('INSERT INTO segments(file,text,kind,loc,end,vec,sets_scale) VALUES(?,?,?,?,?,?,?)',
-                             (file_id, text, segment_kind, loc, end, vec, sets_scale))
+            row = db.execute('INSERT INTO segments(id,file,text,kind,loc,end,vec,sets_scale) VALUES(?,?,?,?,?,?,?,?)',
+                             (next_segment_id(db), file_id, text, segment_kind, loc, end, vec, sets_scale))
             db.execute('INSERT INTO words(rowid,path,text) VALUES(?,?,?)', (row.lastrowid, str(path), text))
     return True
 
@@ -56,6 +62,25 @@ def reuse(db, path, stat, kind, options, print_):
 def lock_path(db_path=None):
     """Un cerrojo por índice: las pruebas con su propia base no chocan con el servicio."""
     return Path(db_path).with_suffix('.lock') if db_path else DATA/'index.lock'
+
+
+class Changed(Exception):
+    """El archivo cambió mientras se leía: se reintenta más tarde, no se guarda como fallo."""
+
+
+def errors_log(db_path=None):
+    """Registro de fallos junto a su índice: las pruebas con su propia base no escriben en el del usuario."""
+    return Path(db_path).with_name(Path(db_path).stem + '-errors.log') if db_path else DATA/'index-errors.log'
+
+
+def log_error(path, exc, db_path=None, limit=1 << 20):
+    log = errors_log(db_path)
+    try:
+        if log.stat().st_size > limit: log.replace(log.with_name(log.name + '.1'))  # keep one previous file
+    except OSError: pass
+    try:
+        with log.open('a') as out: out.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {path}: {exc}\n")
+    except OSError: pass  # a full or read-only disk must not stop indexing
 
 
 def write_status(state):
@@ -77,7 +102,12 @@ def index(config=None, stop=None, notify=None, db_path=None, engine=None,
         db = connect(db_path)
         engine = engine or Engine()
         state = {'running':True,'done':0,'unchanged':0,'partial':0,'errors':0,'current':'','started':time.time()}
-        def report():
+        reported = 0.0
+        def report(final=False):
+            nonlocal reported
+            # Thousands of unchanged files pass per second: status is rewritten at most 4 times a second.
+            if not final and time.monotonic()-reported < .25: return
+            reported = time.monotonic()
             if report_status: write_status(state)
             if notify: notify(state.copy())
         report()
@@ -98,13 +128,14 @@ def index(config=None, stop=None, notify=None, db_path=None, engine=None,
                 if stop and stop.is_set(): break
                 state['current'] = str(path)
                 report()
-                staging = None
+                staging = iterator = None
+                stat = None
+                options = all_options.setdefault(kind, reader_options(config, kind))
                 try:
                     if not path.is_file() or path.is_symlink():
                         with db: db.execute('DELETE FROM files WHERE path=?',(str(path),))
                         continue
                     stat = path.stat()
-                    options = all_options.setdefault(kind, reader_options(config, kind))
                     old = db.execute('SELECT * FROM files WHERE path=?',(str(path),)).fetchone()
                     same = bool(old and not old['error'] and old['kind']==kind and old['options']==options
                                 and old['mtime']==stat.st_mtime_ns and old['size']==stat.st_size)
@@ -162,7 +193,7 @@ def index(config=None, stop=None, notify=None, db_path=None, engine=None,
                         staging.execute('INSERT INTO staged VALUES(?,?,?,?,?,?)',(path.stem,'name',None,None,vector.astype('<f4').tobytes(),1))
                     after = path.stat()
                     if (after.st_mtime_ns,after.st_size)!=(stat.st_mtime_ns,stat.st_size):
-                        raise ValueError('El archivo cambió mientras se leía; se reintentará')
+                        raise Changed('El archivo cambió mientras se leía; se reintentará')
                     with db:
                         db.execute('''INSERT INTO files(path,mtime,size,kind,error,options,complete,cursor,fingerprint) VALUES(?,?,?,?,NULL,?,?,?,?)
                            ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime,size=excluded.size,kind=excluded.kind,error=NULL,
@@ -171,23 +202,33 @@ def index(config=None, stop=None, notify=None, db_path=None, engine=None,
                         file_id = db.execute('SELECT id FROM files WHERE path=?',(str(path),)).fetchone()[0]
                         if not same: db.execute('DELETE FROM segments WHERE file=?',(file_id,))
                         for text,segment_kind,loc,end,vec,sets_scale in staging.execute('SELECT * FROM staged'):
-                            row=db.execute('INSERT INTO segments(file,text,kind,loc,end,vec,sets_scale) VALUES(?,?,?,?,?,?,?)',
-                                           (file_id,text,segment_kind,loc,end,vec,sets_scale))
+                            row=db.execute('INSERT INTO segments(id,file,text,kind,loc,end,vec,sets_scale) VALUES(?,?,?,?,?,?,?,?)',
+                                           (next_segment_id(db),file_id,text,segment_kind,loc,end,vec,sets_scale))
                             db.execute('INSERT INTO words(rowid,path,text) VALUES(?,?,?)',(row.lastrowid,str(path),text))
                     state['done' if complete else 'partial'] += 1
                 except InterruptedError: break
                 except EngineError: raise
+                except Changed:
+                    state['changed'] = state.get('changed', 0) + 1  # the previous analysis stays until it settles
                 except Exception as exc:
-                    state['errors'] += 1
-                    with db:
-                        db.execute('DELETE FROM files WHERE path=?',(str(path),))
-                        try:
-                            stat=path.stat()
-                            db.execute('INSERT INTO files(path,mtime,size,kind,error) VALUES(?,?,?,?,?)',
-                                       (str(path),stat.st_mtime_ns,stat.st_size,kind,str(exc)[:500]))
-                        except OSError: pass
-                    with (DATA/'index-errors.log').open('a') as log: log.write(f'{path}: {exc}\n')
+                    try: now = path.stat()
+                    except OSError: now = None
+                    if now is None:
+                        # Deleted while being read: not a failure of the file.
+                        with db: db.execute('DELETE FROM files WHERE path=?',(str(path),))
+                        state['changed'] = state.get('changed', 0) + 1
+                    elif stat and (now.st_mtime_ns,now.st_size)!=(stat.st_mtime_ns,stat.st_size):
+                        # A half-written file («image file is truncated», bad xref): it is read again once it settles.
+                        state['changed'] = state.get('changed', 0) + 1
+                    else:
+                        state['errors'] += 1
+                        with db:
+                            db.execute('DELETE FROM files WHERE path=?',(str(path),))
+                            db.execute('INSERT INTO files(path,mtime,size,kind,error,options) VALUES(?,?,?,?,?,?)',
+                                       (str(path),now.st_mtime_ns,now.st_size,kind,str(exc)[:500],error_options(options,now)))
+                        log_error(path, exc, db_path)
                 finally:
+                    if iterator: iterator.close()  # removes the reader's temporary media now, even after a failure
                     if staging: staging.close()
                 report()
         except Exception as exc:
@@ -196,5 +237,5 @@ def index(config=None, stop=None, notify=None, db_path=None, engine=None,
         finally:
             db.close()
             state.update(running=False,finished=time.time(),current='')
-            report()
+            report(final=True)
     return state

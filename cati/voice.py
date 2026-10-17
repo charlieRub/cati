@@ -2,8 +2,12 @@
 
 Nada se ejecuta en reposo: el micrófono y el modelo de Whisper solo se usan mientras hablas.
 """
+import atexit
+import http.client
+import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -71,10 +75,20 @@ def record(stop=None, on_level=None, max_seconds=15, wait_seconds=6, silence=0.9
             if not speaking and elapsed > wait_seconds: raise NotHeard('No te he oído')
             if elapsed > max_seconds: break
     finally:
-        process.terminate()
-        try: process.wait(timeout=2)
-        except subprocess.TimeoutExpired: process.kill()
+        finish(process)
     return b''.join(frames)
+
+
+def finish(process, grace=2):
+    """Termina un proceso hijo y lo recoge (sin zombis); si no obedece en `grace` segundos, lo mata."""
+    if process is None: return
+    if process.poll() is None:
+        process.terminate()
+        try: process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            process.kill(); process.wait()
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream: stream.close()
 
 
 def whisper(tool='whisper-cli'):
@@ -88,12 +102,26 @@ def whisper(tool='whisper-cli'):
 
 class Server:
     """whisper-server bajo demanda: carga el modelo en el primer uso y lo libera tras dos minutos sin hablar."""
-    def __init__(self, idle=120):
+    def __init__(self, idle=120, startup=30):
         self.idle = idle
+        self.startup = startup
         self.process = None
         self.used = 0.0
         self.lock = threading.Lock()
         self.port = int(load().get('port', 18769)) + 1
+        self.pidfile = DATA / 'voice-server.pid'
+        atexit.register(self.stop)
+
+    def leftover(self):
+        """Un whisper-server que dejó vivo una sesión anterior que se cerró de golpe: retiene memoria y el puerto."""
+        try: pid = int(self.pidfile.read_text())
+        except (OSError, ValueError): return
+        try:
+            line = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+            if any(part.endswith(b'whisper-server') for part in line[:1]) and str(self.port).encode() in line:
+                os.kill(pid, signal.SIGTERM)
+        except (OSError, ValueError): pass
+        self.pidfile.unlink(missing_ok=True)
 
     def url(self):
         return f'http://127.0.0.1:{self.port}'
@@ -102,20 +130,29 @@ class Server:
         with self.lock:
             self.used = time.monotonic()
             if self.process and self.process.poll() is None: return True
+            finish(self.process)   # one that died on its own: collect it
+            self.process = None
             binary, weights = whisper('whisper-server')
             language = load().get('voice_language', 'es')
+            self.leftover()
             self.process = subprocess.Popen([str(binary), '-m', str(weights), '--host', '127.0.0.1', '--port', str(self.port),
                                              '-l', language, '-nt', '-t', '4', '--prompt', 'Búsqueda de archivos en el ordenador.'],
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            deadline = time.monotonic() + 30
+            try:
+                DATA.mkdir(parents=True, exist_ok=True)
+                self.pidfile.write_text(str(self.process.pid))
+            except OSError: pass
+            deadline = time.monotonic() + self.startup
             while time.monotonic() < deadline:
-                if self.process.poll() is not None: return False
+                if self.process.poll() is not None: break
                 try:
                     urllib.request.urlopen(self.url(), timeout=1).close()
                     threading.Thread(target=self.reaper, daemon=True).start()
                     return True
                 except OSError:
                     time.sleep(.1)
+            # Never ready (or died): do not leave it running in the background holding the model.
+            self.halt()
             return False
 
     def reaper(self):
@@ -124,7 +161,7 @@ class Server:
             with self.lock:
                 if self.process is None or self.process.poll() is not None: return
                 if time.monotonic() - self.used > self.idle:
-                    self.process.terminate(); self.process = None
+                    self.halt()
                     return
 
     def transcribe(self, wav):
@@ -139,10 +176,14 @@ class Server:
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.read().decode('utf-8', 'replace')
 
+    def halt(self):
+        """Detiene el servidor (con el cerrojo ya tomado)."""
+        finish(self.process)
+        self.process = None
+        self.pidfile.unlink(missing_ok=True)
+
     def stop(self):
-        with self.lock:
-            if self.process and self.process.poll() is None: self.process.terminate()
-            self.process = None
+        with self.lock: self.halt()
 
 
 _server = None
@@ -176,7 +217,7 @@ def transcribe(source, language=None, persistent=True):
         if persistent:
             try:
                 if server().ensure(): return clean(server().transcribe(path.read_bytes()))
-            except OSError:
+            except (OSError, http.client.HTTPException):
                 server().stop()
         result = subprocess.run([str(binary), '-m', str(weights), '-f', str(path), '-l', language, '-nt', '-np',
                                  '-ac', str(context(path.stat().st_size - 44)),

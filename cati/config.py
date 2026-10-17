@@ -22,14 +22,18 @@ DEFAULTS = {"folders": [user_folder('DOCUMENTS', 'Documents'), user_folder('DOWN
             "code": False, "media": True, "port": 18769, "threads": 4,
             "max_file_mb": 500, "max_text_mb": 32, "max_pdf_pages": 5000, "video_stride": 8,
             "exclude": [str(PROJECT)], "gpu_layers": 0}
+# Go's module/build downloads are visible below ~/go, unlike other hidden caches.
+DEPENDENCY_CACHES = [str(Path(p).expanduser()/'pkg') for p in os.getenv('GOPATH',str(Path.home()/'go')).split(os.pathsep) if p]
 DEFAULTS.update(scope='computer', skip_datasets=False, project_screenshots_only=False,
-                scan_seconds=1800, event_delay=2, job_segments=16, job_seconds=2, engine_idle=900)
+                scan_seconds=1800, scan_debounce_seconds=30, event_delay=2, workers=1,
+                job_segments=32, job_seconds=2, job_delay=.25, engine_idle=900)
+DEFAULTS.update(background_duty=.25)
 
 
 def load():
-    if CONFIG.exists():
-        return DEFAULTS | json.loads(CONFIG.read_text())
-    return DEFAULTS.copy()
+    config = DEFAULTS | (json.loads(CONFIG.read_text()) if CONFIG.exists() else {})
+    config['exclude'] = list(dict.fromkeys(config['exclude'] + DEPENDENCY_CACHES))
+    return config
 
 
 def save(config):
@@ -45,3 +49,12 @@ def prepare():
     DATA.chmod(0o700)
     if not CONFIG.exists():
         save(DEFAULTS)
+
+
+def give_back_memory():
+    """Devuelve al sistema la memoria ya liberada: glibc la retiene en sus montículos si no se le pide."""
+    import ctypes
+    import gc
+    gc.collect()
+    try: ctypes.CDLL(None).malloc_trim(0)
+    except (AttributeError, OSError): pass

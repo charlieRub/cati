@@ -12,8 +12,11 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import sys
 import zipfile
+from collections import OrderedDict
 from datetime import datetime
+from functools import cache
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -23,6 +26,7 @@ from .catalog import category
 
 CACHE = DATA / 'previews'
 TEXT_LIMIT = 400_000
+OFFICE_LIMIT = 120_000   # una hoja de cálculo enorme: basta el principio para reconocerla
 MONTHS = 'ene feb mar abr may jun jul ago sep oct nov dic'.split()
 
 
@@ -71,17 +75,135 @@ def thumbnail(path, kind, size=128):
     return publish(dest, write)
 
 
-def pdf_pages(path):
+def pdf_info(path):
+    """Páginas y proporción alto/ancho de la primera, con una sola lectura del documento."""
+    if poppler():
+        document, lock = pdf_document(path)
+        with lock:
+            width, height = document.get_page(0).get_size() if document.get_n_pages() else (1, 1.414)
+            return max(1, document.get_n_pages()), (height / width if width else 1.414)
     info = run(['pdfinfo', str(path)]).stdout.decode(errors='replace')
-    match = re.search(r'^Pages:\s+(\d+)', info, re.M)
-    return int(match[1]) if match else 1
+    pages = re.search(r'^Pages:\s+(\d+)', info, re.M)
+    size = re.search(r'^Page size:\s+([\d.]+) x ([\d.]+)', info, re.M)
+    return (int(pages[1]) if pages else 1), (float(size[2]) / float(size[1]) if size and float(size[1]) else 1.414)
+
+
+def pdf_pages(path):
+    return pdf_info(path)[0]
 
 
 def pdf_size(path):
     """Proporción alto/ancho de la primera página, para reservar el hueco de cada página antes de dibujarla."""
-    info = run(['pdfinfo', str(path)]).stdout.decode(errors='replace')
-    match = re.search(r'^Page size:\s+([\d.]+) x ([\d.]+)', info, re.M)
-    return float(match[2]) / float(match[1]) if match and float(match[1]) else 1.414
+    return pdf_info(path)[1]
+
+
+@cache
+def poppler():
+    """Poppler en el propio proceso: renderiza una página hasta 15 veces más rápido que lanzar pdftoppm."""
+    try:
+        import gi
+        gi.require_version('Poppler', '0.18')
+        from gi.repository import Poppler
+        import cairo  # noqa: F401
+        return Poppler
+    except (ImportError, ValueError):
+        return None
+
+
+_documents = OrderedDict()
+_documents_lock = threading.Lock()
+
+
+def pdf_document(path):
+    """Documento abierto (y su cerrojo: Poppler no admite dos hilos en el mismo documento); guarda los últimos ocho."""
+    from gi.repository import Gio
+    stat = os.stat(path)
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    with _documents_lock:
+        if key in _documents:
+            _documents.move_to_end(key)
+            return _documents[key]
+    document = poppler().Document.new_from_file(Gio.File.new_for_path(str(path)).get_uri(), None)
+    with _documents_lock:
+        entry = _documents.setdefault(key, (document, threading.Lock()))
+        while len(_documents) > 8: _documents.popitem(last=False)
+        return entry
+
+
+def pdf_texture(path, page, width=1400):
+    """Textura de una página (1 = primera) a `width` píxeles de ancho, lista para GTK."""
+    from gi.repository import Gdk, GLib
+    if not poppler():
+        return Gdk.Texture.new_from_filename(str(pdf_page(path, page, width)))
+    import cairo
+    document, lock = pdf_document(path)
+    with lock:
+        sheet = document.get_page(page - 1)
+        if sheet is None: raise ValueError(f'el documento no tiene página {page}')
+        points_wide, points_high = sheet.get_size()
+        scale = width / max(points_wide, 1)
+        height = max(1, round(points_high * scale))
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        context = cairo.Context(surface)
+        context.set_source_rgb(1, 1, 1)
+        context.paint()
+        context.scale(scale, scale)
+        sheet.render(context)
+    surface.flush()
+    # Cairo guarda ARGB premultiplicado en el orden de bytes de la máquina.
+    layout = Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED if sys.byteorder == 'little' else Gdk.MemoryFormat.A8R8G8B8_PREMULTIPLIED
+    return Gdk.MemoryTexture.new(width, height, layout, GLib.Bytes.new(bytes(surface.get_data())), surface.get_stride())
+
+
+def image_texture(path, limit=2400):
+    """Datos de la imagen y su textura. GTK decodifica JPEG/PNG/TIFF a tamaño completo más rápido que
+    escalar con GdkPixbuf (la GPU reduce al dibujar); las fotos giradas o enormes van por GdkPixbuf."""
+    from gi.repository import Gdk
+    info = image_info(path)
+    width, height = info.get('size', (0, 0))
+    if info.get('orientation', 1) == 1 and 0 < width * height <= 24_000_000:
+        try: return info, Gdk.Texture.new_from_filename(str(path))
+        except Exception: pass
+    import gi
+    gi.require_version('GdkPixbuf', '2.0')
+    from gi.repository import GdkPixbuf
+    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), limit, limit, True)
+    pixbuf = pixbuf.apply_embedded_orientation() or pixbuf
+    return info, Gdk.Texture.new_for_pixbuf(pixbuf)
+
+
+class Textures:
+    """Texturas recientes en memoria (por ruta, fecha y tamaño): volver a un archivo es instantáneo."""
+    def __init__(self, budget=160 * 1024 * 1024):
+        self.budget, self.used, self.items, self.lock = budget, 0, OrderedDict(), threading.Lock()
+
+    @staticmethod
+    def key(path, *parts):
+        try: stat = os.stat(path)
+        except OSError: return None
+        return (str(path), stat.st_mtime_ns, stat.st_size, *parts)
+
+    def get(self, key):
+        with self.lock:
+            if key not in self.items: return None
+            self.items.move_to_end(key)
+            return self.items[key][0]
+
+    def clear(self):
+        with self.lock:
+            self.items.clear()
+            self.used = 0
+
+    def put(self, key, value, texture=None, cost=None):
+        if key is None: return value
+        if cost is None: cost = texture.get_width() * texture.get_height() * 4 if texture is not None else 1024
+        with self.lock:
+            if key in self.items: self.used -= self.items.pop(key)[1]
+            self.items[key] = (value, cost)
+            self.used += cost
+            while self.used > self.budget and len(self.items) > 1:
+                self.used -= self.items.popitem(last=False)[1][1]
+        return value
 
 
 OFFICE = {'.docx', '.doc', '.odt', '.rtf', '.pptx', '.ppt', '.odp', '.xlsx', '.xls', '.ods', '.epub'}
@@ -167,8 +289,9 @@ def image_info(path):
         with Image.open(path) as source:
             width, height = source.size
             orientation = source.getexif().get(0x0112, 1)
-            if orientation in {5, 6, 7, 8}: width, height = height, width
-            return {'resolution': f'{width}×{height}', 'format': source.format}
+            shown = (height, width) if orientation in {5, 6, 7, 8} else (width, height)
+            return {'resolution': f'{shown[0]}×{shown[1]}', 'format': source.format, 'size': (width, height),
+                    'orientation': orientation}
     except Exception:
         return {}
 
@@ -179,8 +302,8 @@ def read_text(path):
     path = Path(path)
     ext = path.suffix.lower()
     if ext in OFFICE:
-        text = document(path)
-        return text[:TEXT_LIMIT], len(text) > TEXT_LIMIT
+        text = document(path, limit=OFFICE_LIMIT)
+        return text[:OFFICE_LIMIT], len(text) > OFFICE_LIMIT
     with path.open('rb') as handle:
         raw = handle.read(TEXT_LIMIT + 1)
     if b'\x00' in raw[:4096]: raise ValueError('binario')

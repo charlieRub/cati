@@ -1,10 +1,11 @@
 """Catálogo de nombres: cada archivo y carpeta, aunque su contenido no se analice."""
 import ctypes
+import errno
 import os
 import time
 from pathlib import Path
 
-from .readers import AUDIO, CODE, IMAGES, SKIP_DIRS, TEXT, VIDEO, allowed
+from .readers import AUDIO, CODE, IMAGES, SKIP_DIRS, TEXT, VIDEO, allowed, toolchain_dir
 
 SHEETS = {".xlsx", ".xls", ".ods", ".csv", ".tsv", ".numbers"}
 SLIDES = {".pptx", ".ppt", ".odp", ".key"}
@@ -78,8 +79,9 @@ def visible(name, is_dir):
     return allowed(Path(name))
 
 
-def walk_all(roots, excluded=(), stop=None, on_directory=None):
-    """Recorre carpetas y archivos con scandir; omite ocultos, dependencias y credenciales."""
+def walk_all(roots, excluded=(), stop=None, on_directory=None, unreadable=None):
+    """Recorre carpetas y archivos con scandir; omite ocultos, dependencias y credenciales.
+    Con `unreadable`, anota las carpetas que existen pero no se pudieron listar."""
     excluded = {Path(p) for p in excluded}
     for root in roots:
         root = Path(root)
@@ -87,10 +89,14 @@ def walk_all(roots, excluded=(), stop=None, on_directory=None):
         while stack:
             if stop and stop.is_set(): return
             folder = stack.pop()
-            if folder in excluded: continue
+            if folder in excluded or folder.is_symlink(): continue
+            if folder != root and toolchain_dir(str(folder)): continue
             if on_directory: on_directory(folder)
             try: entries = list(os.scandir(folder))
-            except OSError: continue
+            except OSError as exc:
+                # Gone is gone; anything else (EIO, a stalled network mount, EACCES) says nothing about its files.
+                if unreadable is not None and exc.errno not in (errno.ENOENT, errno.ENOTDIR): unreadable.append(folder)
+                continue
             for entry in entries:
                 try:
                     if entry.is_symlink(): continue
@@ -110,15 +116,27 @@ def row(root, path, is_dir, size, mtime, btime=None):
     return str(path), name, folders, ext, int(is_dir), size, mtime, birth(path, mtime) if btime is None else btime
 
 
-def sync(db, roots, excluded=(), stop=None, on_directory=None, files=None):
+def sync(db, roots, excluded=(), stop=None, on_directory=None, files=None, subtrees=None, unreadable=None):
     """Aplica solo las diferencias con el catálogo guardado; devuelve el número de elementos.
-    Con `files`, acumula (ruta, tamaño, mtime) de cada archivo para no recorrer el disco dos veces."""
+    Con `files`, acumula (ruta, tamaño, mtime) de cada archivo para no recorrer el disco dos veces;
+    con `unreadable`, las carpetas que no se pudieron listar (sus filas se conservan)."""
     # Rows saved before creation dates existed (btime NULL) count as changed and get it filled in.
-    known = {path: (mtime, size) if btime is not None else None
-             for path, mtime, size, btime in db.execute("SELECT path,mtime,size,btime FROM catalog")}
+    scopes = [Path(p) for p in subtrees] if subtrees is not None else None
+    old = []
+    if scopes is None:
+        old = db.execute("SELECT path,mtime,size,btime FROM catalog")
+    else:
+        for scope in scopes:
+            key = str(scope)
+            old.extend(db.execute("SELECT path,mtime,size,btime FROM catalog WHERE path>=? AND path<?",
+                                  (key + '/', key + '0')))
+    known = {path: (mtime, size) if btime is not None else None for path, mtime, size, btime in old}
     seen = set()
     changed = []
-    for root, path, is_dir, size, mtime in walk_all(roots, excluded, stop, on_directory):
+    unreadable = [] if unreadable is None else unreadable
+    for root, path, is_dir, size, mtime in walk_all(roots if scopes is None else scopes, excluded, stop, on_directory, unreadable):
+        if scopes is not None:
+            root = next((Path(r) for r in roots if path == Path(r) or Path(r) in path.parents), root)
         key = str(path)
         seen.add(key)
         if files is not None and not is_dir: files.append((path, size, mtime))
@@ -127,7 +145,8 @@ def sync(db, roots, excluded=(), stop=None, on_directory=None, files=None):
             upsert(db, changed); changed = []
     if stop and stop.is_set(): return len(seen)
     upsert(db, changed)
-    gone = [(p,) for p in known.keys() - seen]
+    kept = tuple(str(p) + '/' for p in unreadable)
+    gone = [(p,) for p in known.keys() - seen if not (kept and p.startswith(kept))]
     with db:
         db.executemany("DELETE FROM catalog WHERE path=?", gone)
     return len(seen)
@@ -138,7 +157,11 @@ def upsert(db, rows):
     with db:
         db.executemany("""INSERT INTO catalog(path,name,folders,ext,is_dir,size,mtime,btime) VALUES(?,?,?,?,?,?,?,?)
           ON CONFLICT(path) DO UPDATE SET name=excluded.name,folders=excluded.folders,ext=excluded.ext,
-          is_dir=excluded.is_dir,size=excluded.size,mtime=excluded.mtime,btime=excluded.btime""", rows)
+          is_dir=excluded.is_dir,size=excluded.size,mtime=excluded.mtime,btime=excluded.btime
+          WHERE catalog.name IS NOT excluded.name OR catalog.folders IS NOT excluded.folders
+             OR catalog.ext IS NOT excluded.ext OR catalog.is_dir IS NOT excluded.is_dir
+             OR catalog.size IS NOT excluded.size OR catalog.mtime IS NOT excluded.mtime
+             OR catalog.btime IS NOT excluded.btime""", rows)
 
 
 def touch(db, roots, paths):
