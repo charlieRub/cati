@@ -1,0 +1,43 @@
+Use case: style-transfer
+Asset type: explanatory README diagram for the Linux application Cati, styled to match the actual Cati GTK interface under the user's active Omarchy Moodpeak theme.
+Input images: Image 1 is the existing diagram EDIT TARGET, used ONLY for its information and logical connections. Image 2 is a real Cati screenshot and the authoritative STYLE REFERENCE. Replace Image 1's entire appearance. Every typeface, surface, border and accent must follow the application, using the exact specification below.
+
+AUTHORITATIVE VISUAL SPECIFICATION, extracted from cati/gui.py, cati/explorer.py and the active Omarchy colors.toml:
+- Main canvas / window background: flat solid #181c22.
+- Header, footer and inset preview areas: flat solid #101318.
+- Raised surface: #23272d.
+- Selected row: #2c3444.
+- Primary foreground text: #e0e6ed.
+- Muted metadata: #7b8599.
+- Borders and separators: #3d4455.
+- Active controls, arrows and left selection rule: #4ecdc4.
+- Image-kind / semantic annotation accent, used sparingly: #b388eb.
+- Only use these colors. The screenshot may differ slightly because of capture encoding; these HEX values take priority.
+- Typeface for EVERY character, including the title, quote, labels, numbers and footer: JetBrainsMono Nerd Font / JetBrains Mono, a true MONOSPACED coding font matching Image 2. Every character has equal advance width. Use regular 400 and bold 700 only. All text must look like the app, with no serif or proportional typography.
+- Work on a logical 1920px-wide grid. Scale uniformly if another native resolution is required. Nominal sizes at 1920px: main title 48px, node title 34px bold, main body 32px, section labels 28px, metadata 26px. Body line height 1.35. The image will display at 960px wide, so keep body text readable at roughly 16px.
+- Every panel and chip has exactly SQUARE corners, 0px radius, a 2px solid #3d4455 outline. No pill shapes or circular number badges.
+- Separate panes using hairline straight rules, like Cati's results/preview split. Selected items use a 6px LEFT stripe in #4ecdc4, and the selected row background #2c3444. This is the source app's visual grammar.
+- Use flat solid fills, sharp clean edges and crisp glyphs. Zero shadows, blur, transparency, bloom, lighting, textures, gradients, glass, beveling or 3D. Do not recreate Hyprland's desktop frame or Walker's rounded launcher; reproduce Cati's own squared GTK controls.
+- Keep the diagram an honest explanatory graphic. No fake performance numbers, fabricated live UI, photos, result thumbnails, browser chrome, decorative illustrations or huge icons.
+- Use one compact dark header, aligned technical content and a thin dark footer; not a marketing poster. Small lowercase brand "cati" may appear in turquoise, with the letter spacing seen in the screenshot.
+- Arrows are thin #4ecdc4 lines with simple arrowheads, strictly directional and never crossing a word or an unrelated box.
+- Accurate Spanish accents and exact requested wording. No extra copy and no watermark.
+- Export an opaque bitmap.
+
+FIGURE 1 CONTENT AND LAYOUT
+Logical canvas: 1920 × 1008.
+Header: x=0 y=0 width=1920 height=150, fill #101318, bottom separator #3d4455. Small lowercase "cati" at x=48 y=40, turquoise 28px; metadata "FIG. 01" top right. Main heading "Buscar con una frase" at x=48 y=108, 48px monospaced white, regular weight.
+Three square-cornered panes, x positions 48, 696, 1344, width 528 each, top y=230 and bottom y=820. The first and third use #101318, the middle uses #181c22. Each has a thin #3d4455 border. Padding 32px.
+Pane 1 heading: small "01" muted, then "Consulta" in 34px bold white. Below the heading a horizontal divider. Large monospaced query in 44px white on exactly these two lines:
+«fotos de la playa
+en descargas»
+The text must fit without entering the right padding or changing to proportional fonts.
+Pane 2 heading: "02" muted then "Filtros y tema" in 34px bold white. Below, three aligned rows separated by thin gray rules. Exact label/value pairs:
+"Tipo" / "Imágenes"
+"Carpeta" / "Descargas"
+"Tema" / "Playa"
+Labels in muted text, values in white, except "Imágenes" in #b388eb. The first row is selected using the source app's #2c3444 fill and 6px turquoise LEFT selection stripe. No icons. No rounded tag.
+Pane 3 heading: "03" muted then "Resultados" in 34px bold white. Three well-spaced rows "Nombre", "Palabras", "Significado" in white; connect them with small turquoise plus signs. Bottom inset separated by a gray rule, label "Vista previa" then on next line "del archivo".
+Two horizontal turquoise arrows, entirely within the gaps between panes, point pane 1 to pane 2 and pane 2 to pane 3. The arrowheads stop short of the destination borders.
+Footer at y=910 height=98, #101318, thin top rule. Left footer "Consulta en lenguaje natural"; right footer "Procesamiento local", both muted 26px monospaced.
+Keep all three panes equal width, all headers aligned, all text left-aligned except the plus signs, no giant typography. Read the result like Cati's own dark search interface, rendered as a diagram.
